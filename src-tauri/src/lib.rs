@@ -11,6 +11,7 @@ fn get_ip() -> String {
 
 mod signaling;
 mod types;
+mod virtual_cam;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
