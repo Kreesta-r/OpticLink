@@ -1,11 +1,7 @@
-use windows::{
-    core::*,
-    Win32::Media::MediaFoundation::*,
-    Win32::System::Com::*,
-    Win32::Foundation::*,
-};
-
-use windows_implement::implement;
+use windows::core::*;
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::*;
+use windows::Win32::Foundation::*;
 
 #[implement(IMFMediaSource, IMFMediaEventGenerator, IMFAttributes)]
 pub struct OpticLinkMediaSource {
@@ -24,7 +20,6 @@ impl IMFMediaSource_Impl for OpticLinkMediaSource {
     }
 
     fn CreatePresentationDescriptor(&self) -> Result<IMFPresentationDescriptor> {
-        // Todo: Return a descriptor for 720p/1080p video
         Err(Error::from(E_NOTIMPL))
     }
 
@@ -184,3 +179,5 @@ impl IMFAttributes_Impl for OpticLinkMediaSource {
         Err(Error::from(E_NOTIMPL))
     }
 }
+
+
