@@ -1,4 +1,4 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+use tauri::Manager;
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -12,6 +12,8 @@ fn get_ip() -> String {
 mod signaling;
 mod types;
 mod virtual_cam;
+mod media_stream;
+mod webrtc_client;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
