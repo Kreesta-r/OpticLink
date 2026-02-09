@@ -22,11 +22,15 @@ pub async fn start_server(port: u16, static_dir: String) {
         });
 
     // Static files (for phone client)
-    // In dev, we can just proxy or serve a placeholder.
-    // In prod, we serve the 'dist' folder.
-    let static_files = warp::fs::dir(static_dir);
+    let static_dir_clone = static_dir.clone();
+    let static_files = warp::fs::dir(static_dir.clone());
+    
+    // SPA fallback: serve index.html for any path that doesn't match a file
+    let index_path = std::path::PathBuf::from(&static_dir_clone).join("index.html");
+    let spa_fallback = warp::any()
+        .and(warp::fs::file(index_path));
 
-    let routes = signaling.or(static_files);
+    let routes = signaling.or(static_files).or(spa_fallback);
 
     println!("Signaling server running on 0.0.0.0:{}", port);
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;

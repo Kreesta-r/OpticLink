@@ -21,9 +21,24 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // Start Signaling Server on Port 3001
-            // In prod, serve the frontend build. In dev, just serve placeholder.
-            let resource_path = app.path().resource_dir().unwrap_or_default().join("public");
-            let static_dir = resource_path.to_string_lossy().to_string();
+            // Serve the frontend build from 'dist' folder
+            let app_path = app.path();
+            
+            // In production, resources are bundled. In dev, use ../dist relative to src-tauri
+            let static_dir = app_path.resource_dir()
+                .ok()
+                .and_then(|p| {
+                    let bundled = p.join("_up_/dist");
+                    if bundled.exists() { Some(bundled) } else { None }
+                })
+                .unwrap_or_else(|| {
+                    // Dev mode: use relative path from workspace
+                    std::env::current_dir().unwrap().parent().unwrap().join("dist")
+                })
+                .to_string_lossy()
+                .to_string();
+            
+            println!("Serving static files from: {}", static_dir);
 
             tauri::async_runtime::spawn(async move {
                 signaling::start_server(3001, static_dir).await;

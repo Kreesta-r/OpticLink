@@ -1,0 +1,33 @@
+﻿
+> opticlink@0.1.0 build
+> vite build
+
+[36mvite v7.3.1 [32mbuilding client environment for production...[36m[39m
+transforming...
+[32mΓ£ô[39m 19 modules transformed.
+node.exe : [31mΓ£ù[39m Build failed in 885ms
+At C:\Program Files\nodejs\npm.ps1:29 char:3
++   & $NODE_EXE $NPM_CLI_JS $args
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([31m 
+   Γ£ù[39m Build failed in 885ms:String) [], Rem  
+  oteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[31merror during build:
+[31mCould not resolve "../styles/theme.css" from 
+"src/components/Layout/MainLayout.tsx"[31m
+file: [36mC:/Users/user/Documents/goti/OpticLink/s
+rc/components/Layout/MainLayout.tsx[31m
+    at getRollupError (file:///C:/Users/user/Docume
+nts/goti/OpticLink/node_modules/rollup/dist/es/shar
+ed/parseAst.js:402:41)
+    at error (file:///C:/Users/user/Documents/goti/
+OpticLink/node_modules/rollup/dist/es/shared/parseA
+st.js:398:42)
+    at ModuleLoader.handleInvalidResolvedId (file:/
+//C:/Users/user/Documents/goti/OpticLink/node_modul
+es/rollup/dist/es/shared/node-entry.js:21687:24)
+    at file:///C:/Users/user/Documents/goti/OpticLi
+nk/node_modules/rollup/dist/es/shared/node-entry.js
+:21647:26[39m
