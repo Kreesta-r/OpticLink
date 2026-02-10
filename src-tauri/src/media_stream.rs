@@ -7,50 +7,22 @@ use std::collections::VecDeque;
 
 use windows::core::implement;
 
-struct SharedState {
-    requests: VecDeque<()>, // Store tokens/requests. unique_token?
+pub struct SharedState {
+    requests: VecDeque<()>, // Store tokens/requests
     frame_buffer: Option<Vec<u8>>,
 }
 
-#[implement(IMFMediaStream, IMFMediaEventGenerator)]
-pub struct OpticLinkMediaStream {
-    event_queue: IMFMediaEventQueue,
+#[derive(Clone)]
+pub struct OpticLinkFrameSink {
     state: Arc<Mutex<SharedState>>,
+    event_queue: IMFMediaEventQueue,
 }
 
-impl OpticLinkMediaStream {
-    pub fn new() -> Result<Self> {
-        let event_queue = unsafe { MFCreateEventQueue()? };
-        
-        Ok(Self {
-            event_queue,
-            state: Arc::new(Mutex::new(SharedState {
-                requests: VecDeque::new(),
-                frame_buffer: None,
-            })),
-        })
-    }
+// IMFMediaEventQueue is thread-safe (MTA)
+unsafe impl Send for OpticLinkFrameSink {}
+unsafe impl Sync for OpticLinkFrameSink {}
 
-    pub fn queue_started(&self) -> Result<()> {
-        unsafe {
-            self.event_queue.QueueEventParamVar(
-                MEStreamStarted.0 as u32, 
-                &GUID::zeroed(), 
-                S_OK, 
-                std::ptr::null()
-            )?;
-        }
-        Ok(())
-    }
-
-    pub fn shutdown(&self) -> Result<()> {
-        unsafe {
-            self.event_queue.Shutdown()?;
-        }
-        Ok(())
-    }
-
-    // Called by WebRTC Client when a frame is available
+impl OpticLinkFrameSink {
     pub fn push_frame(&self, frame: Vec<u8>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         
@@ -99,6 +71,52 @@ impl OpticLinkMediaStream {
     }
 }
 
+#[implement(IMFMediaStream, IMFMediaEventGenerator)]
+pub struct OpticLinkMediaStream {
+    event_queue: IMFMediaEventQueue,
+    state: Arc<Mutex<SharedState>>,
+}
+
+impl OpticLinkMediaStream {
+    pub fn new() -> Result<(Self, OpticLinkFrameSink)> {
+        let event_queue = unsafe { MFCreateEventQueue()? };
+        
+        let state = Arc::new(Mutex::new(SharedState {
+            requests: VecDeque::new(),
+            frame_buffer: None,
+        }));
+
+        let sink = OpticLinkFrameSink {
+            state: state.clone(),
+            event_queue: event_queue.clone(),
+        };
+
+        Ok((Self {
+            event_queue,
+            state: state.clone(),
+        }, sink))
+    }
+
+    pub fn queue_started(&self) -> Result<()> {
+        unsafe {
+            self.event_queue.QueueEventParamVar(
+                MEStreamStarted.0 as u32, 
+                &GUID::zeroed(), 
+                S_OK, 
+                std::ptr::null()
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        unsafe {
+            self.event_queue.Shutdown()?;
+        }
+        Ok(())
+    }
+}
+
 impl IMFMediaStream_Impl for OpticLinkMediaStream {
     fn GetMediaSource(&self) -> Result<IMFMediaSource> {
         // TODO: Return weak reference to parent source?
@@ -116,6 +134,13 @@ impl IMFMediaStream_Impl for OpticLinkMediaStream {
         if let Some(frame) = state.frame_buffer.take() {
             // Have frame, send it
             drop(state); // Unlock
+            
+            // Reuse Sink's logic? Or duplicate?
+            // Since we don't have Sink here (unless we store it), clean to duplicate or extract helper.
+            // Let's create a temporary sink helper or just invoke similar logic.
+            // Actually, we can't use Sink here easily without refactoring 'create_sample' to be static or on a shared helper.
+            // But wait, 'create_sample' is stateless except for MF calls.
+            
             let sample = self.create_sample(&frame)?;
             unsafe {
                 self.event_queue.QueueEventParamUnk(
@@ -148,5 +173,29 @@ impl IMFMediaEventGenerator_Impl for OpticLinkMediaStream {
 
     fn QueueEvent(&self, met: u32, guidextendedtype: *const GUID, hrstatus: HRESULT, pvalue: *const PROPVARIANT) -> Result<()> {
         unsafe { self.event_queue.QueueEventParamVar(met, guidextendedtype, hrstatus, pvalue) }
+    }
+}
+
+impl OpticLinkMediaStream {
+    fn create_sample(&self, frame: &[u8]) -> Result<IMFSample> {
+        unsafe {
+            let sample = MFCreateSample()?;
+            
+            let buffer = MFCreateMemoryBuffer(frame.len() as u32)?;
+            
+            let mut ptr = std::ptr::null_mut();
+            let mut _len = 0; // max length
+            let mut _current_len = 0;
+            buffer.Lock(&mut ptr, Some(&mut _len), Some(&mut _current_len))?;
+            
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), ptr, frame.len());
+            
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(frame.len() as u32)?;
+            
+            sample.AddBuffer(&buffer)?;
+            
+            Ok(sample)
+        }
     }
 }

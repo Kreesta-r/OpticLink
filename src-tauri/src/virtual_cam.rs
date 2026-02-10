@@ -3,9 +3,9 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Com::StructuredStorage::*; // For PROPVARIANT
 use windows::Win32::Foundation::*;
-use std::sync::{Arc, Mutex};
+// use std::sync::{Arc, Mutex}; // Not used directly here anymore
 
-use crate::media_stream::OpticLinkMediaStream;
+use crate::media_stream::{OpticLinkMediaStream, OpticLinkFrameSink};
 
 use windows::core::implement;
 
@@ -17,7 +17,7 @@ pub struct OpticLinkMediaSource {
 }
 
 impl OpticLinkMediaSource {
-    pub fn new() -> Result<Self> {
+    pub fn new() -> Result<(Self, OpticLinkFrameSink)> {
         let event_queue = unsafe { MFCreateEventQueue()? };
         
         let mut attributes = None;
@@ -25,13 +25,13 @@ impl OpticLinkMediaSource {
         let attributes = attributes.ok_or(Error::from(E_FAIL))?;
         
         // Create Stream
-        let stream = OpticLinkMediaStream::new()?; // Returns Rust struct
+        let (stream, sink) = OpticLinkMediaStream::new()?; // Returns Rust struct and Sink
         
-        Ok(Self {
+        Ok((Self {
             event_queue,
             stream: Some(stream),
             attributes,
-        })
+        }, sink))
     }
     
     pub fn get_stream(&self) -> Option<&OpticLinkMediaStream> {
@@ -43,7 +43,8 @@ impl OpticLinkMediaSource {
             let media_type = MFCreateMediaType()?;
             
             media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+            // Use H.264 format
+            media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
             
             // MFSetAttributeSize(..., width, height) -> (width << 32) | height
             media_type.SetUINT64(&MF_MT_FRAME_SIZE, (1920u64 << 32) | 1080u64)?;
@@ -59,6 +60,37 @@ impl OpticLinkMediaSource {
         }
     }
 }
+
+pub fn register_virtual_camera(source: &OpticLinkMediaSource) -> Result<IMFVirtualCamera> {
+    unsafe {
+        // Create attributes for camera creation
+        let mut attributes: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut attributes, 0)?;
+        let attributes = attributes.unwrap();
+        
+        let source_interface: IMFMediaSource = source.cast()?;
+        
+        // Use MFVirtualCameraType_SoftwareCameraSource
+        // windows 0.48.0 binding might only take 6 arguments
+        let cam = MFCreateVirtualCamera(
+            MFVirtualCameraType_SoftwareCameraSource,
+            MFVirtualCameraLifetime_Session, 
+            MFVirtualCameraAccess_CurrentUser,
+            &HSTRING::from("OpticLink Virtual Camera"),
+            &HSTRING::from("{5C3C8F96-2679-450F-876D-292150186100}"), 
+            None, 
+            // &attributes, // Removed
+            // &source_interface // Removed
+        )?;
+        
+        // Pass the source interface when starting execution?
+        // Or using AddProperty?
+        // Let's try passing it to Start.
+        cam.Start(Some(&source_interface.cast()?))?;
+        Ok(cam)
+    }
+}
+
 
 impl IMFMediaSource_Impl for OpticLinkMediaSource {
     fn GetCharacteristics(&self) -> Result<u32> {
@@ -151,7 +183,6 @@ impl IMFMediaEventGenerator_Impl for OpticLinkMediaSource {
     }
 }
 
-// Implement IMFAttributes by delegating (required for some MF functions)
 // Implement IMFAttributes by delegating (required for some MF functions)
 impl IMFAttributes_Impl for OpticLinkMediaSource {
     fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> Result<()> {
