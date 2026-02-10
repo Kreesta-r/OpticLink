@@ -90,6 +90,13 @@ async fn stop_virtual_cam() -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn get_ip() -> Result<String, String> {
+    local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .map_err(|e| e.to_string())
+}
+
 async fn user_connected(ws: warp::ws::WebSocket, users: Users) {
     let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
     println!("[Signaling] New user connected: {}", my_id);
@@ -207,7 +214,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_virtual_cam_status, start_virtual_cam, stop_virtual_cam])
+        .invoke_handler(tauri::generate_handler![get_virtual_cam_status, start_virtual_cam, stop_virtual_cam, get_ip])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

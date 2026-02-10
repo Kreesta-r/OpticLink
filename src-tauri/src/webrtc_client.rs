@@ -194,7 +194,7 @@ pub async fn start_virtual_cam_client(
     let ws_write_ice = ws_write.clone();
     tokio::spawn(async move {
         while let Some(msg) = ice_rx.recv().await {
-            let writer = ws_write_ice.lock().await;
+            let mut writer = ws_write_ice.lock().await;
             let _ = writer.send(Message::Text(msg.into())).await;
         }
     });

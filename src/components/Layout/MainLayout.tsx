@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import Sidebar from './Sidebar';
 import PreviewPanel from './PreviewPanel';
 import ControlBar from './ControlBar';
@@ -65,15 +66,11 @@ export default function MainLayout() {
         ws.onmessage = async (event) => {
             const msg = JSON.parse(event.data);
 
-            if (msg.type === 'offer') {
-                await handleOffer(msg, ws);
-            } else if (msg.type === 'ice-candidate' && pcRef.current) {
-                await pcRef.current.addIceCandidate(new RTCIceCandidate({
-                    candidate: msg.candidate,
-                    sdpMid: msg.sdp_mid,
-                    sdpMLineIndex: msg.sdp_m_line_index
-                }));
-            }
+            // Backend handles WebRTC now. Frontend just monitors.
+            // if (msg.type === 'offer') {
+            //    await handleOffer(msg, ws);
+            // }
+            console.log("WS Message:", msg.type);
         };
     };
 
@@ -152,10 +149,74 @@ export default function MainLayout() {
         if (pcRef.current) pcRef.current.close();
     };
 
-    const toggleVirtualCam = async () => {
-        // TODO: Invoke Tauri command
-        setVirtualCamActive(!virtualCamActive);
+    const startPreview = async () => {
+        try {
+            // Give the VCam a moment to register if just started
+            await new Promise(r => setTimeout(r, 1000));
+
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const vcam = devices.find(d => d.label.includes("OpticLink"));
+
+            if (vcam) {
+                console.log("Found VCam:", vcam.label);
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { deviceId: { exact: vcam.deviceId } }
+                });
+                if (videoRef.current) {
+                    videoRef.current.srcObject = stream;
+                    // Mute local playback to prevent audio loop if any (video only anyway)
+                    videoRef.current.muted = true;
+                }
+            } else {
+                console.warn("OpticLink Virtual Camera not found in devices");
+            }
+        } catch (e) {
+            console.error("Preview error:", e);
+        }
     };
+
+    const stopPreview = () => {
+        if (videoRef.current && videoRef.current.srcObject) {
+            const stream = videoRef.current.srcObject as MediaStream;
+            stream.getTracks().forEach(t => t.stop());
+            videoRef.current.srcObject = null;
+        }
+    };
+
+    const toggleVirtualCam = async () => {
+        try {
+            if (virtualCamActive) {
+                await invoke('stop_virtual_cam');
+                setVirtualCamActive(false);
+                stopPreview();
+            } else {
+                await invoke('start_virtual_cam');
+                setVirtualCamActive(true);
+                startPreview(); // Start loopback preview
+            }
+        } catch (e) {
+            console.error("Failed to toggle camera:", e);
+        }
+    };
+
+
+    // Poll backend status
+    useEffect(() => {
+        const interval = setInterval(async () => {
+            try {
+                const statusStr = await invoke<string>('get_virtual_cam_status');
+                const status = JSON.parse(statusStr);
+                setVirtualCamActive(status.active);
+                // Update connection stats based on backend?
+                if (status.active) {
+                    setConnectionStats(prev => ({ ...prev, status: 'live' }));
+                }
+            } catch (e) {
+                // console.error(e);
+            }
+        }, 1000);
+        return () => clearInterval(interval);
+    }, []);
 
     return (
         <div className="main-layout">
