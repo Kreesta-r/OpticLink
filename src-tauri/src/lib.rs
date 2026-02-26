@@ -150,7 +150,7 @@ async fn user_connected(ws: warp::ws::WebSocket, users: Users) {
 pub fn run() {
     tauri::Builder::default()
         .setup(|_app| {
-            // Start Signaling Server
+            // Start Signaling Server + Static file server for phone client
             let users: Users = Arc::new(Mutex::new(HashMap::new()));
             let users = warp::any().map(move || users.clone());
 
@@ -160,10 +160,17 @@ pub fn run() {
                 .map(|ws: warp::ws::Ws, users| {
                     ws.on_upgrade(move |socket| user_connected(socket, users))
                 });
+
+            let dist_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
+            let static_files = warp::get().and(warp::fs::dir(dist_dir.clone()));
+            let index_path = dist_dir.join("index.html");
+            let spa_fallback = warp::get().and(warp::any()).and(warp::fs::file(index_path));
+
+            let routes = ws_route.or(static_files).or(spa_fallback);
             
             tauri::async_runtime::spawn(async move {
-                println!("[Signaling] Server running on 0.0.0.0:3001/ws");
-                warp::serve(ws_route).run(([0, 0, 0, 0], 3001)).await;
+                println!("[Signaling] Server running on 0.0.0.0:3001 (WebSocket + phone client)");
+                warp::serve(routes).run(([0, 0, 0, 0], 3001)).await;
             });
             
             // WebRTC Client / Pipe

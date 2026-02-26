@@ -77,6 +77,21 @@ pub struct OpticLinkMediaStream {
     state: Arc<Mutex<SharedState>>,
 }
 
+fn create_h264_stream_descriptor() -> Result<IMFStreamDescriptor> {
+    unsafe {
+        let media_type = MFCreateMediaType()?;
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, (1920u64 << 32) | 1080u64)?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, (30u64 << 32) | 1u64)?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1u64)?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        let media_types = [Some(media_type)];
+        MFCreateStreamDescriptor(0, &media_types)
+    }
+}
+
 impl OpticLinkMediaStream {
     pub fn new() -> Result<(Self, OpticLinkFrameSink)> {
         let event_queue = unsafe { MFCreateEventQueue()? };
@@ -124,8 +139,7 @@ impl IMFMediaStream_Impl for OpticLinkMediaStream {
     }
 
     fn GetStreamDescriptor(&self) -> Result<IMFStreamDescriptor> {
-        // TODO: Create and return descriptor
-        Err(Error::from(E_NOTIMPL))
+        create_h264_stream_descriptor()
     }
 
     fn RequestSample(&self, _punktoken: Option<&IUnknown>) -> Result<()> {

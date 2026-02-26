@@ -74,7 +74,9 @@ export default function PreviewPanel({ videoRef, status, stats }: PreviewPanelPr
                             <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
                                 {status === 'disconnected'
                                     ? 'Scan the QR code with your phone to start streaming'
-                                    : 'Phone connected, waiting for camera access'}
+                                    : status === 'connected'
+                                        ? '1. Turn on Virtual Cam below 2. Phone taps Start Streaming'
+                                        : 'Phone connected, waiting for stream'}
                             </p>
                         </div>
                     </div>

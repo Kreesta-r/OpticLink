@@ -2,18 +2,25 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { QRCodeSVG } from 'qrcode.react';
 
-interface SidebarProps {
-    status: 'disconnected' | 'connecting' | 'connected' | 'live';
+interface ConnectedDevice {
+    id: string;
+    deviceName: string;
+    platform: string;
 }
 
-export default function Sidebar({ status }: SidebarProps) {
+interface SidebarProps {
+    status: 'disconnected' | 'connecting' | 'connected' | 'live';
+    connectedDevices?: ConnectedDevice[];
+}
+
+export default function Sidebar({ status, connectedDevices = [] }: SidebarProps) {
     const [ip, setIp] = useState<string | null>(null);
 
     useEffect(() => {
         invoke<string>('get_ip').then(setIp).catch(console.error);
     }, []);
 
-    const connectionUrl = ip ? `http://${ip}:3000/#phone` : '';
+    const connectionUrl = ip ? `http://${ip}:3001/#phone` : '';
 
     const getStatusText = () => {
         switch (status) {
@@ -41,6 +48,16 @@ export default function Sidebar({ status }: SidebarProps) {
                             <span className={`status-dot ${status}`}></span>
                             {getStatusText()}
                         </div>
+                        {connectedDevices.length > 0 && (
+                            <div className="connected-devices-list">
+                                {connectedDevices.map(d => (
+                                    <div key={d.id} className="device-chip">
+                                        📱 {d.deviceName}
+                                        {d.platform && <span className="device-platform"> · {d.platform}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>

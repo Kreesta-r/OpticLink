@@ -7,6 +7,7 @@ import StatusBar from './StatusBar';
 import SettingsModal from '../Settings/SettingsModal';
 import '../../styles/theme.css';
 import './Layout.css';
+import LoadingScreen from './LoadingScreen';
 
 interface ConnectionStats {
     latency: number;
@@ -18,6 +19,7 @@ interface ConnectionStats {
 
 export default function MainLayout() {
     const [showSettings, setShowSettings] = useState(false);
+    const [showScanner, setShowScanner] = useState(true);
     const [virtualCamActive, setVirtualCamActive] = useState(false);
     const [connectionStats, setConnectionStats] = useState<ConnectionStats>({
         latency: 0,
@@ -26,6 +28,7 @@ export default function MainLayout() {
         fps: 0,
         status: 'disconnected'
     });
+    const [connectedDevices, setConnectedDevices] = useState<{ id: string; deviceName: string; platform: string }[]>([]);
 
     const videoRef = useRef<HTMLVideoElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
@@ -37,6 +40,12 @@ export default function MainLayout() {
         return () => {
             cleanup();
         };
+    }, []);
+
+    // Auto-dismiss loading screen after 1 second
+    useEffect(() => {
+        const t = setTimeout(() => setShowScanner(false), 1000);
+        return () => clearTimeout(t);
     }, []);
 
     const connectWebSocket = () => {
@@ -65,12 +74,21 @@ export default function MainLayout() {
 
         ws.onmessage = async (event) => {
             const msg = JSON.parse(event.data);
-
-            // Backend handles WebRTC now. Frontend just monitors.
-            // if (msg.type === 'offer') {
-            //    await handleOffer(msg, ws);
-            // }
-            console.log("WS Message:", msg.type);
+            if (msg.type === 'phone-hello') {
+                setConnectedDevices(prev => {
+                    const id = msg.deviceName + (msg.platform || '');
+                    if (prev.some(d => d.id === id)) return prev;
+                    return [...prev, {
+                        id,
+                        deviceName: msg.deviceName || 'Mobile Device',
+                        platform: msg.platform || ''
+                    }];
+                });
+                setConnectionStats(prev => ({ ...prev, status: 'connected' }));
+            } else if (msg.type === 'client-disconnect') {
+                setConnectedDevices(prev => prev.filter(d => d.id !== msg.clientId));
+                setConnectionStats(prev => prev.status === 'live' ? prev : { ...prev, status: 'disconnected' });
+            }
         };
     };
 
@@ -223,6 +241,7 @@ export default function MainLayout() {
             <div className="layout-content">
                 <Sidebar
                     status={connectionStats.status}
+                    connectedDevices={connectedDevices}
                 />
                 <PreviewPanel
                     videoRef={videoRef}
@@ -235,12 +254,14 @@ export default function MainLayout() {
                 onToggleVirtualCam={toggleVirtualCam}
                 onOpenSettings={() => setShowSettings(true)}
                 status={connectionStats.status}
+                connectedCount={connectedDevices.length}
             />
             <StatusBar stats={connectionStats} />
 
             {showSettings && (
                 <SettingsModal onClose={() => setShowSettings(false)} />
             )}
+            <LoadingScreen visible={showScanner} onDismiss={() => setShowScanner(false)} />
         </div>
     );
 }

@@ -102,21 +102,19 @@ impl H264Assembler {
 pub async fn start_virtual_cam_client(
     frame_tx: mpsc::UnboundedSender<VideoFrame>,
 ) -> Result<()> {
-    // Wait a bit for the signaling server to start
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    
     println!("[VCam Client] Connecting to signaling server...");
     
     let url = "ws://127.0.0.1:3001/ws";
     let (ws_stream, _) = connect_async(url).await?;
-    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let (ws_write, mut ws_read) = ws_stream.split();
+    let ws_write = Arc::new(tokio::sync::Mutex::new(ws_write));
     
     println!("[VCam Client] Connected to signaling server");
     
-    // Create WebRTC API
     let mut media_engine = webrtc::api::media_engine::MediaEngine::default();
     media_engine.register_default_codecs()?;
-    
     let api = webrtc::api::APIBuilder::new()
         .with_media_engine(media_engine)
         .build();
@@ -129,123 +127,125 @@ pub async fn start_virtual_cam_client(
         ..Default::default()
     };
     
-    let pc = Arc::new(api.new_peer_connection(config).await?);
-    
-    // Channel for ICE candidates to send via WS
+    let mut current_pc: Option<Arc<webrtc::peer_connection::RTCPeerConnection>> = None;
     let (ice_tx, mut ice_rx) = mpsc::unbounded_channel::<String>();
-    
-    // Handle ICE candidates
-    let ice_tx_clone = ice_tx.clone();
-    pc.on_ice_candidate(Box::new(move |candidate| {
-        let tx = ice_tx_clone.clone();
-        Box::pin(async move {
-            if let Some(c) = candidate {
-                let json = c.to_json().unwrap();
-                let msg = serde_json::json!({
-                    "type": "ice-candidate",
-                    "candidate": json.candidate,
-                    "sdp_mid": json.sdp_mid.unwrap_or_default(),
-                    "sdp_m_line_index": json.sdp_mline_index.unwrap_or(0),
-                    "target": "phone"
-                });
-                let _ = tx.send(msg.to_string());
-            }
-        })
-    }));
-    
-    // Handle incoming tracks (video from phone)
-    let frame_tx_clone = frame_tx.clone();
-    pc.on_track(Box::new(move |track, _receiver, _transceiver| {
-        let tx = frame_tx_clone.clone();
-        Box::pin(async move {
-            println!("[VCam Client] Track received: codec={}", track.codec().capability.mime_type);
-            
-            // Read RTP packets from track
-            let mut buf = vec![0u8; 1500];
-            let mut assembler = H264Assembler::new();
-            
-            loop {
-                match track.read(&mut buf).await {
-                    Ok((rtp_packet, _attributes)) => {
-                        let payload = &rtp_packet.payload;
-                        if let Some(frame) = assembler.push(payload, rtp_packet.header.timestamp) {
-                            let _ = tx.send(frame);
-                        }
-                    }
-                    Err(e) => {
-                        println!("[VCam Client] Track read error: {}", e);
-                        break;
-                    }
-                }
-            }
-        })
-    }));
-    
-    // Handle connection state changes
-    pc.on_peer_connection_state_change(Box::new(|state| {
-        println!("[VCam Client] Connection state: {}", state);
-        Box::pin(async {})
-    }));
-    
-    let pc_clone = pc.clone();
-    
-    // Spawn task to send ICE candidates via WebSocket
-    let ws_write = Arc::new(tokio::sync::Mutex::new(ws_write));
     let ws_write_ice = ws_write.clone();
     tokio::spawn(async move {
         while let Some(msg) = ice_rx.recv().await {
-            let mut writer = ws_write_ice.lock().await;
-            let _ = writer.send(Message::Text(msg.into())).await;
+            let mut w = ws_write_ice.lock().await;
+            if let Err(e) = w.send(WsMsg::Text(msg.into())).await {
+                eprintln!("[VCam Client] ICE send error: {}", e);
+                break;
+            }
         }
     });
     
-    // Read signaling messages
-    while let Some(Ok(msg)) = ws_read.next().await {
+    while let Some(msg_result) = ws_read.next().await {
+        let msg = match msg_result {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[VCam Client] WS read error: {}", e);
+                break;
+            }
+        };
         if let Message::Text(text) = msg {
             let text_str: &str = text.as_ref();
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text_str) {
-                match json["type"].as_str() {
-                    Some("id") => {
-                        println!("[VCam Client] Got ID: {}", json["id"]);
+            let json: serde_json::Value = match serde_json::from_str(text_str) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            match json["type"].as_str() {
+                Some("offer") => {
+                    let sdp = json["sdp"].as_str().unwrap_or_default();
+                    if sdp.is_empty() {
+                        eprintln!("[VCam Client] Offer has empty SDP");
+                        continue;
                     }
-                    Some("offer") => {
-                        println!("[VCam Client] Received offer, creating answer...");
-                        
-                        let sdp = json["sdp"].as_str().unwrap_or_default();
-                        let offer = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp.to_string())?;
-                        
-                        pc_clone.set_remote_description(offer).await?;
-                        
-                        let answer = pc_clone.create_answer(None).await?;
-                        pc_clone.set_local_description(answer.clone()).await?;
-                        
-                        let answer_msg = serde_json::json!({
-                            "type": "answer",
-                            "sdp": answer.sdp,
-                            "target": "phone"
-                        });
-                        
-                        let mut writer = ws_write.lock().await;
-                        writer.send(Message::Text(answer_msg.to_string().into())).await?;
-                        
-                        println!("[VCam Client] Answer sent");
+                    if let Some(old) = current_pc.take() {
+                        let _ = old.close().await;
                     }
-                    Some("ice-candidate") => {
+                    println!("[VCam Client] Received offer, creating answer...");
+                    
+                    let pc = Arc::new(api.new_peer_connection(config.clone()).await?);
+                    let ice_tx_c = ice_tx.clone();
+                    pc.on_ice_candidate(Box::new(move |candidate| {
+                        let tx = ice_tx_c.clone();
+                        Box::pin(async move {
+                            if let Some(c) = candidate {
+                                let json = c.to_json().unwrap();
+                                let msg = serde_json::json!({
+                                    "type": "ice-candidate",
+                                    "candidate": json.candidate,
+                                    "sdp_mid": json.sdp_mid.unwrap_or_default(),
+                                    "sdp_m_line_index": json.sdp_mline_index.unwrap_or(0),
+                                    "target": "phone"
+                                });
+                                let _ = tx.send(msg.to_string());
+                            }
+                        })
+                    }));
+                    let frame_tx_c = frame_tx.clone();
+                    pc.on_track(Box::new(move |track, _receiver, _transceiver| {
+                        let tx = frame_tx_c.clone();
+                        Box::pin(async move {
+                            println!("[VCam Client] Track received: codec={}", track.codec().capability.mime_type);
+                            let mut buf = vec![0u8; 1500];
+                            let mut assembler = H264Assembler::new();
+                            loop {
+                                match track.read(&mut buf).await {
+                                    Ok((rtp_packet, _attributes)) => {
+                                        let payload = &rtp_packet.payload;
+                                        if let Some(frame) = assembler.push(payload, rtp_packet.header.timestamp) {
+                                            let _ = tx.send(frame);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("[VCam Client] Track read error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                    }));
+                    pc.on_peer_connection_state_change(Box::new(|state| {
+                        println!("[VCam Client] Connection state: {}", state);
+                        Box::pin(async {})
+                    }));
+                    
+                    let offer = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp.to_string())?;
+                    pc.set_remote_description(offer).await?;
+                    let answer = pc.create_answer(None).await?;
+                    pc.set_local_description(answer.clone()).await?;
+                    
+                    let answer_msg = serde_json::json!({
+                        "type": "answer",
+                        "sdp": answer.sdp,
+                        "target": "phone"
+                    });
+                    {
+                        let mut w = ws_write.lock().await;
+                        w.send(Message::Text(answer_msg.to_string().into())).await?;
+                    }
+                    println!("[VCam Client] Answer sent");
+                    current_pc = Some(pc);
+                }
+                Some("ice-candidate") => {
+                    if let Some(ref pc) = current_pc {
                         let candidate = json["candidate"].as_str().unwrap_or_default();
                         let sdp_mid = json["sdp_mid"].as_str().map(|s| s.to_string());
                         let sdp_mline_index = json["sdp_m_line_index"].as_u64().map(|n| n as u16);
-                        
                         let ice = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
                             candidate: candidate.to_string(),
                             sdp_mid,
                             sdp_mline_index,
                             username_fragment: None,
                         };
-                        
-                        pc_clone.add_ice_candidate(ice).await?;
+                        if let Err(e) = pc.add_ice_candidate(ice).await {
+                            eprintln!("[VCam Client] add_ice_candidate error: {}", e);
+                        }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }

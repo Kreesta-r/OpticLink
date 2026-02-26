@@ -80,6 +80,20 @@
     color: var(--text-muted);
 }
 
+.connected-devices-list {
+    margin-top: 6px;
+}
+
+.device-chip {
+    font-size: 11px;
+    color: var(--accent-success, #22c55e);
+    padding: 2px 0;
+}
+
+.device-platform {
+    color: var(--text-muted);
+}
+
 /* Preview Panel */
 .preview-panel {
     flex: 1;
