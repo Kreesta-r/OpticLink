@@ -261,3 +261,50 @@
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+
+.qr-hint {
+    margin-bottom: 12px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.qr-https-note {
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--accent-warning);
+    text-align: center;
+}
+
+.qr-loading {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* Sidebar info section */
+.sidebar-info {
+    padding: 14px 12px;
+    flex: 1;
+}
+
+.sidebar-info p {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.6;
+    margin-bottom: 10px;
+}
+
+.sidebar-info ol {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.9;
+    padding-left: 18px;
+}
+
+.sidebar-info ol strong {
+    color: var(--text-secondary);
+}
+
+.sidebar-info ol em {
+    color: var(--accent-info);
+    font-style: normal;
+}

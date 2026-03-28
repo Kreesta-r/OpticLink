@@ -376,3 +376,102 @@ body {
   transform: translateX(16px);
   background: var(--text-bright);
 }
+
+/* ── Toast notifications ──────────────────────────────────────────────── */
+.toast-container {
+  position: fixed;
+  bottom: 48px; /* above status bar */
+  right: 16px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--border-radius-lg);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  color: var(--text-primary);
+  min-width: 200px;
+  max-width: 320px;
+  pointer-events: all;
+  cursor: pointer;
+  animation: toast-in 0.2s ease;
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+.toast.toast-exit {
+  opacity: 0;
+  transform: translateX(20px);
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(20px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.toast-success { border-left: 3px solid var(--accent-success); }
+.toast-error   { border-left: 3px solid var(--accent-error); }
+.toast-info    { border-left: 3px solid var(--accent-primary); }
+.toast-warning { border-left: 3px solid var(--accent-warning); }
+
+.toast-dot {
+  flex-shrink: 0;
+}
+
+.toast-message {
+  flex: 1;
+}
+
+/* ── Status bar value text ────────────────────────────────────────────── */
+.status-value {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* ── Control bar virtual cam status label ─────────────────────────────── */
+.vcam-status-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ── Settings info box ────────────────────────────────────────────────── */
+.settings-info-box {
+  padding: 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--border-radius);
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+/* ── Preview panel overlay text ───────────────────────────────────────── */
+.preview-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.preview-subtitle {
+  font-size: 13px;
+  color: var(--text-muted);
+  max-width: 340px;
+  line-height: 1.5;
+}
+
+.preview-icon-wrap {
+  margin-bottom: 16px;
+}
