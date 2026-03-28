@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpticLink",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.user.opticlink",
   "build": {
     "beforeDevCommand": "npm run build && npm run dev",
@@ -13,8 +13,11 @@
     "windows": [
       {
         "title": "OpticLink",
-        "width": 800,
-        "height": 600
+        "width": 960,
+        "height": 620,
+        "minWidth": 800,
+        "minHeight": 540,
+        "resizable": true
       }
     ],
     "security": {

@@ -1,3 +1,5 @@
+import { IconCamera, IconCameraOff, IconSettings, IconMirror, IconVolume } from '../Icons';
+
 interface ControlBarProps {
     virtualCamActive: boolean;
     onToggleVirtualCam: () => void;
@@ -11,9 +13,10 @@ export default function ControlBar({
     onToggleVirtualCam,
     onOpenSettings,
     status,
-    connectedCount = 0
+    connectedCount = 0,
 }: ControlBarProps) {
-    const canUseVirtualCam = status === 'connected' || status === 'live';
+    // Virtual cam can always be toggled — user should start it before the phone streams
+    const isLive = status === 'live';
 
     return (
         <div className="control-bar">
@@ -21,42 +24,41 @@ export default function ControlBar({
                 <button
                     className={`btn ${virtualCamActive ? 'btn-danger' : 'btn-primary'}`}
                     onClick={onToggleVirtualCam}
-                    disabled={!canUseVirtualCam}
-                    title={virtualCamActive ? 'Stop Virtual Camera' : 'Start Virtual Camera (do this before streaming)'}
+                    title={virtualCamActive ? 'Stop Virtual Camera' : 'Start Virtual Camera'}
                 >
-                    <span>📷</span>
-                    {virtualCamActive ? 'Stop Virtual Cam' : 'Start Virtual Cam'}
+                    {virtualCamActive
+                        ? <><IconCameraOff size={15} /> Stop Virtual Cam</>
+                        : <><IconCamera size={15} /> Start Virtual Cam</>
+                    }
                 </button>
 
                 <div className="control-divider" />
 
                 <button
-                    className="btn"
-                    disabled={!canUseVirtualCam}
-                    title="Mute Audio"
+                    className="btn btn-icon"
+                    disabled
+                    title="Mirror Video (coming soon)"
                 >
-                    🔊
+                    <IconMirror size={15} />
                 </button>
 
                 <button
-                    className="btn"
-                    disabled={!canUseVirtualCam}
-                    title="Mirror Video"
+                    className="btn btn-icon"
+                    disabled
+                    title="Audio (coming soon)"
                 >
-                    ↔️
+                    <IconVolume size={15} />
                 </button>
             </div>
 
             <div className="control-group">
-                <span style={{
-                    fontSize: 12,
-                    color: virtualCamActive ? 'var(--accent-success)' : 'var(--text-muted)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6
-                }}>
+                <span className="vcam-status-label">
                     {virtualCamActive && <span className="status-dot connected" />}
-                    {virtualCamActive ? 'Virtual Camera Active' : connectedCount > 0 ? 'Turn on before phone streams' : 'Virtual Camera Off'}
+                    {virtualCamActive
+                        ? 'Virtual Camera Active'
+                        : connectedCount > 0
+                            ? 'Start Virtual Cam before streaming'
+                            : 'Virtual Camera Off'}
                 </span>
 
                 <div className="control-divider" />
@@ -66,7 +68,7 @@ export default function ControlBar({
                     onClick={onOpenSettings}
                     title="Settings"
                 >
-                    ⚙️
+                    <IconSettings size={15} />
                 </button>
             </div>
         </div>

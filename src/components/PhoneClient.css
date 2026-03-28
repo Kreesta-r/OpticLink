@@ -1,92 +1,249 @@
-/* Mobile-first, responsive phone client */
-.phone-client-root {
-    background: var(--bg-primary);
-    min-height: 100vh;
-    min-height: 100dvh;
+/* ── Phone Client — full-screen native-feel UI ───────────────────────── */
+.phone-root {
+    position: fixed;
+    inset: 0;
     display: flex;
     flex-direction: column;
-    position: relative;
+    background: #000;
+    /* Prevent any bounce/overscroll */
+    overflow: hidden;
+    touch-action: none;
 }
 
-.phone-video-wrap {
+/* ── Viewport (camera preview fills everything) ──────────────────────── */
+.phone-viewport {
+    position: relative;
     flex: 1;
     min-height: 0;
-    position: relative;
     background: #000;
+    overflow: hidden;
 }
 
 .phone-video {
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
     object-fit: cover;
-    display: block;
 }
 
-.phone-live-badge {
+/* ── Overlay controls (top corners) ──────────────────────────────────── */
+.phone-top-left {
     position: absolute;
-    top: max(12px, env(safe-area-inset-top));
-    left: max(12px, env(safe-area-inset-left));
+    top: max(16px, env(safe-area-inset-top, 16px));
+    left: max(16px, env(safe-area-inset-left, 16px));
+    z-index: 10;
+}
+
+.phone-top-right {
+    position: absolute;
+    top: max(16px, env(safe-area-inset-top, 16px));
+    right: max(16px, env(safe-area-inset-right, 16px));
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+/* ── LIVE badge ───────────────────────────────────────────────────────── */
+.phone-live-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    background: var(--status-live, #e63946);
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+/* ── Status pill (non-live states) ───────────────────────────────────── */
+.phone-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-radius: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.phone-status-text {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.9);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+/* ── Icon buttons (flip, torch) ──────────────────────────────────────── */
+.phone-icon-btn {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    background: var(--status-live, #22c55e);
-    border-radius: var(--border-radius, 6px);
-    font-size: 12px;
-    font-weight: 600;
-    color: white;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 50%;
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    -webkit-tap-highlight-color: transparent;
 }
 
-/* Control bar - safe area aware, always visible */
-.phone-control-bar {
+.phone-icon-btn:active {
+    transform: scale(0.92);
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.phone-icon-btn.active {
+    background: rgba(255, 220, 80, 0.7);
+    color: #000;
+}
+
+.phone-icon-btn:disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+/* ── Connecting overlay ───────────────────────────────────────────────── */
+.phone-overlay-center {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+}
+
+.phone-spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid rgba(255, 255, 255, 0.2);
+    border-top-color: var(--accent-primary, #007acc);
+    border-radius: 50%;
+    animation: phone-spin 0.7s linear infinite;
+}
+
+@keyframes phone-spin {
+    to { transform: rotate(360deg); }
+}
+
+.phone-overlay-text {
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.85);
+    font-weight: 500;
+}
+
+/* ── Bottom control bar ───────────────────────────────────────────────── */
+.phone-bar {
     flex-shrink: 0;
-    padding: 12px 16px;
-    padding-bottom: max(12px, env(safe-area-inset-bottom));
-    background: var(--bg-secondary);
-    border-top: 1px solid var(--border-subtle);
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 10px;
+    padding: 16px 20px;
+    padding-bottom: max(16px, env(safe-area-inset-bottom, 16px));
+    background: var(--bg-secondary, #252526);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.phone-status-row {
+/* ── Buttons ─────────────────────────────────────────────────────────── */
+.phone-btn {
+    width: 100%;
+    max-width: 340px;
+    padding: 14px 24px;
+    font-size: 15px;
+    font-weight: 600;
+    border-radius: 10px;
     display: flex;
     align-items: center;
-    gap: 8px;
-    color: var(--text-secondary);
-    font-size: 14px;
+    justify-content: center;
+    gap: 10px;
+    -webkit-tap-highlight-color: transparent;
+    transition: opacity 0.15s, transform 0.1s;
+}
+
+.phone-btn:active {
+    transform: scale(0.97);
+    opacity: 0.85;
+}
+
+.phone-btn:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+}
+
+.phone-start-btn {
+    background: var(--accent-primary, #007acc);
+    border-color: var(--accent-primary, #007acc);
+    color: #fff;
+}
+
+.phone-stop-btn {
+    background: var(--accent-error, #f14c4c);
+    border-color: var(--accent-error, #f14c4c);
+    color: #fff;
+    max-width: 220px;
+}
+
+/* ── Error card ───────────────────────────────────────────────────────── */
+.phone-error-card {
+    width: 100%;
+    max-width: 340px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 14px;
+    background: rgba(241, 76, 76, 0.1);
+    border: 1px solid rgba(241, 76, 76, 0.3);
+    border-radius: 10px;
 }
 
 .phone-error-msg {
-    color: var(--accent-error, #ef4444);
     font-size: 13px;
+    color: var(--accent-error, #f14c4c);
     text-align: center;
-    max-width: 280px;
+    line-height: 1.5;
 }
 
-.phone-start-btn,
-.phone-stop-btn {
-    padding: 12px 32px;
-    font-size: 15px;
-    border-radius: var(--border-radius-lg, 8px);
+/* ── Spinner inside button ───────────────────────────────────────────── */
+.phone-btn-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: phone-spin 0.7s linear infinite;
 }
 
-.phone-stop-btn {
-    padding: 10px 28px;
-}
-
+/* ── Tips and branding ───────────────────────────────────────────────── */
 .phone-tip {
-    color: var(--text-muted);
     font-size: 11px;
+    color: var(--text-muted, #6d6d6d);
     text-align: center;
-    max-width: 260px;
+    max-width: 300px;
+    line-height: 1.5;
+}
+
+.phone-tip-warn {
+    color: var(--accent-warning, #dcdcaa);
 }
 
 .phone-branding {
-    color: var(--text-muted);
     font-size: 11px;
-    margin-top: 4px;
+    color: var(--text-muted, #6d6d6d);
 }

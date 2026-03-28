@@ -10,11 +10,13 @@ interface StatusBarProps {
     stats: ConnectionStats;
 }
 
+const VERSION = 'v0.2.0';
+
 export default function StatusBar({ stats }: StatusBarProps) {
     const getStatusText = () => {
         switch (stats.status) {
             case 'live': return 'Streaming';
-            case 'connected': return 'Connected (waiting for video)';
+            case 'connected': return 'Device connected — waiting for stream';
             case 'connecting': return 'Connecting...';
             default: return 'Disconnected';
         }
@@ -24,7 +26,7 @@ export default function StatusBar({ stats }: StatusBarProps) {
         <div className="status-bar">
             <div className="status-group">
                 <div className="status-item">
-                    <span className={`status-dot ${stats.status}`}></span>
+                    <span className={`status-dot ${stats.status}`} />
                     <span>{getStatusText()}</span>
                 </div>
 
@@ -32,19 +34,28 @@ export default function StatusBar({ stats }: StatusBarProps) {
                     <>
                         <div className="status-item">
                             <span>Resolution:</span>
-                            <span style={{ color: 'var(--text-primary)' }}>{stats.resolution}</span>
+                            <span className="status-value">{stats.resolution}</span>
                         </div>
                         <div className="status-item">
                             <span>FPS:</span>
-                            <span style={{ color: 'var(--text-primary)' }}>{stats.fps}</span>
+                            <span className="status-value">{stats.fps}</span>
                         </div>
                         <div className="status-item">
                             <span>Bitrate:</span>
-                            <span style={{ color: 'var(--text-primary)' }}>{Math.round(stats.bitrate)} kbps</span>
+                            <span className="status-value">{stats.bitrate} kbps</span>
                         </div>
                         <div className="status-item">
                             <span>Latency:</span>
-                            <span style={{ color: stats.latency < 100 ? 'var(--accent-success)' : stats.latency < 200 ? 'var(--accent-warning)' : 'var(--accent-error)' }}>
+                            <span
+                                className="status-value"
+                                style={{
+                                    color: stats.latency < 100
+                                        ? 'var(--accent-success)'
+                                        : stats.latency < 200
+                                            ? 'var(--accent-warning)'
+                                            : 'var(--accent-error)',
+                                }}
+                            >
                                 {stats.latency}ms
                             </span>
                         </div>
@@ -53,7 +64,7 @@ export default function StatusBar({ stats }: StatusBarProps) {
             </div>
 
             <div className="status-group">
-                <span>OpticLink v0.1.0</span>
+                <span>OpticLink {VERSION}</span>
             </div>
         </div>
     );
