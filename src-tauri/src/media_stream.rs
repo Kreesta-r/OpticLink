@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use windows::core::implement;
 
 pub struct SharedState {
-    requests: VecDeque<()>, // Store tokens/requests
+    requests: VecDeque<()>,
     frame_buffer: Option<Vec<u8>>,
 }
 
@@ -18,30 +18,25 @@ pub struct OpticLinkFrameSink {
     event_queue: IMFMediaEventQueue,
 }
 
-// IMFMediaEventQueue is thread-safe (MTA)
 unsafe impl Send for OpticLinkFrameSink {}
 unsafe impl Sync for OpticLinkFrameSink {}
 
 impl OpticLinkFrameSink {
     pub fn push_frame(&self, frame: Vec<u8>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        
-        // Check if we have pending requests
-        if let Some(_token) = state.requests.pop_front() {
-             // Fulfill request
-             drop(state); // Unlock before COM ops
-             let sample = self.create_sample(&frame)?;
 
-             unsafe {
+        if let Some(_token) = state.requests.pop_front() {
+            drop(state);
+            let sample = self.create_sample(&frame)?;
+            unsafe {
                 self.event_queue.QueueEventParamUnk(
-                    MEMediaSample.0 as u32, 
-                    &GUID::zeroed(), 
-                    S_OK, 
-                    Some(&sample.cast()?)
+                    MEMediaSample.0 as u32,
+                    &GUID::zeroed(),
+                    S_OK,
+                    Some(&sample.cast()?),
                 )?;
-             }
+            }
         } else {
-            // Buffer frame
             state.frame_buffer = Some(frame);
         }
         Ok(())
@@ -50,22 +45,17 @@ impl OpticLinkFrameSink {
     fn create_sample(&self, frame: &[u8]) -> Result<IMFSample> {
         unsafe {
             let sample = MFCreateSample()?;
-            
             let buffer = MFCreateMemoryBuffer(frame.len() as u32)?;
-            
+
             let mut ptr = std::ptr::null_mut();
-            let mut _len = 0; // max length
+            let mut _len = 0;
             let mut _current_len = 0;
             buffer.Lock(&mut ptr, Some(&mut _len), Some(&mut _current_len))?;
-            
             std::ptr::copy_nonoverlapping(frame.as_ptr(), ptr, frame.len());
-            
             buffer.Unlock()?;
             buffer.SetCurrentLength(frame.len() as u32)?;
-            
+
             sample.AddBuffer(&buffer)?;
-            
-            // Set time/duration if known? For now just data.
             Ok(sample)
         }
     }
@@ -93,9 +83,11 @@ fn create_h264_stream_descriptor() -> Result<IMFStreamDescriptor> {
 }
 
 impl OpticLinkMediaStream {
-    pub fn new() -> Result<(Self, OpticLinkFrameSink)> {
+    /// Returns (IMFMediaStream, stream_event_queue_clone, OpticLinkFrameSink).
+    /// The event queue clone is kept by the source so it can fire MEStreamStarted/etc.
+    pub fn new() -> Result<(IMFMediaStream, IMFMediaEventQueue, OpticLinkFrameSink)> {
         let event_queue = unsafe { MFCreateEventQueue()? };
-        
+
         let state = Arc::new(Mutex::new(SharedState {
             requests: VecDeque::new(),
             frame_buffer: None,
@@ -106,35 +98,19 @@ impl OpticLinkMediaStream {
             event_queue: event_queue.clone(),
         };
 
-        Ok((Self {
-            event_queue,
-            state: state.clone(),
-        }, sink))
-    }
+        // Clone queue before consuming Self into COM object
+        let eq_clone = event_queue.clone();
 
-    pub fn queue_started(&self) -> Result<()> {
-        unsafe {
-            self.event_queue.QueueEventParamVar(
-                MEStreamStarted.0 as u32, 
-                &GUID::zeroed(), 
-                S_OK, 
-                std::ptr::null()
-            )?;
-        }
-        Ok(())
-    }
+        let stream = Self { event_queue, state };
+        let unknown: IUnknown = stream.into(); // COM heap allocation
+        let mf_stream: IMFMediaStream = unknown.cast()?;
 
-    pub fn shutdown(&self) -> Result<()> {
-        unsafe {
-            self.event_queue.Shutdown()?;
-        }
-        Ok(())
+        Ok((mf_stream, eq_clone, sink))
     }
 }
 
 impl IMFMediaStream_Impl for OpticLinkMediaStream {
     fn GetMediaSource(&self) -> Result<IMFMediaSource> {
-        // TODO: Return weak reference to parent source?
         Err(Error::from(E_NOTIMPL))
     }
 
@@ -144,28 +120,19 @@ impl IMFMediaStream_Impl for OpticLinkMediaStream {
 
     fn RequestSample(&self, _punktoken: Option<&IUnknown>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        
+
         if let Some(frame) = state.frame_buffer.take() {
-            // Have frame, send it
-            drop(state); // Unlock
-            
-            // Reuse Sink's logic? Or duplicate?
-            // Since we don't have Sink here (unless we store it), clean to duplicate or extract helper.
-            // Let's create a temporary sink helper or just invoke similar logic.
-            // Actually, we can't use Sink here easily without refactoring 'create_sample' to be static or on a shared helper.
-            // But wait, 'create_sample' is stateless except for MF calls.
-            
+            drop(state);
             let sample = self.create_sample(&frame)?;
             unsafe {
                 self.event_queue.QueueEventParamUnk(
-                    MEMediaSample.0 as u32, 
-                    &GUID::zeroed(), 
-                    S_OK, 
-                    Some(&sample.cast()?)
+                    MEMediaSample.0 as u32,
+                    &GUID::zeroed(),
+                    S_OK,
+                    Some(&sample.cast()?),
                 )?;
             }
         } else {
-            // No frame, queue request
             state.requests.push_back(());
         }
         Ok(())
@@ -177,15 +144,28 @@ impl IMFMediaEventGenerator_Impl for OpticLinkMediaStream {
         unsafe { self.event_queue.GetEvent(dwflags.0 as u32) }
     }
 
-    fn BeginGetEvent(&self, pcallback: Option<&IMFAsyncCallback>, punkstate: Option<&IUnknown>) -> Result<()> {
+    fn BeginGetEvent(
+        &self,
+        pcallback: Option<&IMFAsyncCallback>,
+        punkstate: Option<&IUnknown>,
+    ) -> Result<()> {
         unsafe { self.event_queue.BeginGetEvent(pcallback, punkstate) }
     }
 
-    fn EndGetEvent(&self, presult: Option<&IMFAsyncResult>) -> Result<IMFMediaEvent> {
+    fn EndGetEvent(
+        &self,
+        presult: Option<&IMFAsyncResult>,
+    ) -> Result<IMFMediaEvent> {
         unsafe { self.event_queue.EndGetEvent(presult) }
     }
 
-    fn QueueEvent(&self, met: u32, guidextendedtype: *const GUID, hrstatus: HRESULT, pvalue: *const PROPVARIANT) -> Result<()> {
+    fn QueueEvent(
+        &self,
+        met: u32,
+        guidextendedtype: *const GUID,
+        hrstatus: HRESULT,
+        pvalue: *const PROPVARIANT,
+    ) -> Result<()> {
         unsafe { self.event_queue.QueueEventParamVar(met, guidextendedtype, hrstatus, pvalue) }
     }
 }
@@ -194,21 +174,17 @@ impl OpticLinkMediaStream {
     fn create_sample(&self, frame: &[u8]) -> Result<IMFSample> {
         unsafe {
             let sample = MFCreateSample()?;
-            
             let buffer = MFCreateMemoryBuffer(frame.len() as u32)?;
-            
+
             let mut ptr = std::ptr::null_mut();
-            let mut _len = 0; // max length
+            let mut _len = 0;
             let mut _current_len = 0;
             buffer.Lock(&mut ptr, Some(&mut _len), Some(&mut _current_len))?;
-            
             std::ptr::copy_nonoverlapping(frame.as_ptr(), ptr, frame.len());
-            
             buffer.Unlock()?;
             buffer.SetCurrentLength(frame.len() as u32)?;
-            
+
             sample.AddBuffer(&buffer)?;
-            
             Ok(sample)
         }
     }

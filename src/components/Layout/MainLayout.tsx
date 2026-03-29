@@ -38,13 +38,20 @@ export default function MainLayout() {
 
     const videoRef = useRef<HTMLVideoElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
+    const previewPcRef = useRef<RTCPeerConnection | null>(null);
     const statsIntervalRef = useRef<number | null>(null);
-    // Track previous bytesReceived for delta-based bitrate
     const prevBytesRef = useRef<{ bytes: number; ts: number } | null>(null);
+    // Keep connectedDevices accessible in stale closures
+    const connectedDevicesRef = useRef(connectedDevices);
+    connectedDevicesRef.current = connectedDevices;
 
     const toast = useToast();
+    // Use a ref so ws.onmessage always calls the latest toast.show without
+    // having to list `toast` as a useCallback dep (which would cause reconnects).
+    const toastShowRef = useRef(toast.show);
+    toastShowRef.current = toast.show;
 
-    // ── Loading screen: dismiss after 1 s ──────────────────────────────────
+    // ── Loading screen ──────────────────────────────────────────────────────
     useEffect(() => {
         const t = setTimeout(() => setShowLoading(false), 1000);
         return () => clearTimeout(t);
@@ -73,7 +80,66 @@ export default function MainLayout() {
         return () => clearInterval(interval);
     }, []);
 
-    // ── WebSocket ───────────────────────────────────────────────────────────
+    // ── Stats polling via RTCPeerConnection ────────────────────────────────
+    const startStatsPolling = useCallback((pc: RTCPeerConnection) => {
+        if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
+        prevBytesRef.current = null;
+
+        statsIntervalRef.current = window.setInterval(async () => {
+            try {
+                const stats = await pc.getStats();
+                stats.forEach((report) => {
+                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                        const resolution = `${report.frameWidth || 0}x${report.frameHeight || 0}`;
+                        const fps = Math.round(report.framesPerSecond || 0);
+
+                        const nowBytes: number = report.bytesReceived ?? 0;
+                        const nowTs = Date.now();
+                        let bitrate = 0;
+                        if (prevBytesRef.current) {
+                            const deltaBits = (nowBytes - prevBytesRef.current.bytes) * 8;
+                            const deltaSec = (nowTs - prevBytesRef.current.ts) / 1000;
+                            if (deltaSec > 0) bitrate = Math.round(deltaBits / 1000 / deltaSec);
+                        }
+                        prevBytesRef.current = { bytes: nowBytes, ts: nowTs };
+
+                        setConnectionStats(prev => ({ ...prev, resolution, fps, bitrate }));
+                    }
+                    if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                        const rtt = report.currentRoundTripTime;
+                        if (rtt != null) {
+                            setConnectionStats(prev => ({
+                                ...prev,
+                                latency: Math.round(rtt * 1000),
+                            }));
+                        }
+                    }
+                });
+            } catch {}
+        }, 1000);
+    }, []);
+
+    const stopPreview = useCallback(() => {
+        if (statsIntervalRef.current) {
+            clearInterval(statsIntervalRef.current);
+            statsIntervalRef.current = null;
+        }
+        if (videoRef.current?.srcObject) {
+            const stream = videoRef.current.srcObject as MediaStream;
+            stream.getTracks().forEach(t => t.stop());
+            videoRef.current.srcObject = null;
+        }
+        if (previewPcRef.current) {
+            previewPcRef.current.close();
+            previewPcRef.current = null;
+        }
+        setConnectionStats(prev => ({
+            ...prev,
+            status: connectedDevicesRef.current.length > 0 ? 'connected' : 'disconnected',
+        }));
+    }, []);
+
+    // ── WebSocket + preview WebRTC ──────────────────────────────────────────
     const connectWebSocket = useCallback(() => {
         setConnectionStats(prev => ({ ...prev, status: 'connecting' }));
 
@@ -100,7 +166,7 @@ export default function MainLayout() {
             setConnectionStats(prev => ({ ...prev, status: 'disconnected' }));
         };
 
-        ws.onmessage = (event) => {
+        ws.onmessage = async (event) => {
             let msg: any;
             try {
                 msg = JSON.parse(event.data as string);
@@ -108,11 +174,13 @@ export default function MainLayout() {
                 return;
             }
 
+            // ── Phone connected ────────────────────────────────────────────
             if (msg.type === 'phone-hello') {
                 const id = (msg.deviceName || 'device') + (msg.platform || '');
                 setConnectedDevices(prev => {
                     if (prev.some(d => d.id === id)) return prev;
-                    const newList = [
+                        toastShowRef.current(`${msg.deviceName || 'Phone'} connected`, 'success');
+                    return [
                         ...prev,
                         {
                             id,
@@ -120,13 +188,11 @@ export default function MainLayout() {
                             platform: msg.platform || '',
                         },
                     ];
-                    return newList;
                 });
                 setConnectionStats(prev => ({
                     ...prev,
                     status: prev.status === 'live' ? 'live' : 'connected',
                 }));
-                toast.show(`${msg.deviceName || 'Phone'} connected`, 'success');
 
                 // Auto-start virtual cam when phone connects (if setting enabled)
                 try {
@@ -139,128 +205,123 @@ export default function MainLayout() {
                         }
                     }
                 } catch {}
+
+            // ── Phone disconnected ────────────────────────────────────────
             } else if (msg.type === 'client-disconnect') {
                 setConnectedDevices(prev => prev.filter(d => d.id !== msg.clientId));
-                toast.show('Phone disconnected', 'info');
+                toastShowRef.current('Phone disconnected', 'info');
+
+            // ── Preview offer from phone ──────────────────────────────────
+            } else if (msg.type === 'preview-offer') {
+                try {
+                    // Close any existing preview PC
+                    if (previewPcRef.current) {
+                        previewPcRef.current.close();
+                        previewPcRef.current = null;
+                    }
+                    if (statsIntervalRef.current) {
+                        clearInterval(statsIntervalRef.current);
+                        statsIntervalRef.current = null;
+                    }
+
+                    const pc = new RTCPeerConnection({
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' },
+                            { urls: 'stun:stun1.l.google.com:19302' },
+                        ],
+                    });
+                    previewPcRef.current = pc;
+
+                    pc.ontrack = (trackEvent) => {
+                        if (videoRef.current && trackEvent.streams[0]) {
+                            videoRef.current.srcObject = trackEvent.streams[0];
+                            videoRef.current.muted = true;
+                            setConnectionStats(prev => ({ ...prev, status: 'live' }));
+                            startStatsPolling(pc);
+                        }
+                    };
+
+                    pc.onicecandidate = (iceEvent) => {
+                        if (iceEvent.candidate) {
+                            ws.send(JSON.stringify({
+                                type: 'preview-ice-candidate',
+                                candidate: iceEvent.candidate.candidate,
+                                sdp_mid: iceEvent.candidate.sdpMid,
+                                sdp_m_line_index: iceEvent.candidate.sdpMLineIndex,
+                            }));
+                        }
+                    };
+
+                    pc.onconnectionstatechange = () => {
+                        if (
+                            pc.connectionState === 'disconnected' ||
+                            pc.connectionState === 'failed'
+                        ) {
+                            if (videoRef.current) videoRef.current.srcObject = null;
+                            setConnectionStats(prev => ({
+                                ...prev,
+                                status: prev.status === 'live' ? 'connected' : prev.status,
+                            }));
+                            if (statsIntervalRef.current) {
+                                clearInterval(statsIntervalRef.current);
+                                statsIntervalRef.current = null;
+                            }
+                        }
+                    };
+
+                    await pc.setRemoteDescription(
+                        new RTCSessionDescription({ type: 'offer', sdp: msg.sdp })
+                    );
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+
+                    ws.send(JSON.stringify({
+                        type: 'preview-answer',
+                        sdp: answer.sdp,
+                    }));
+                } catch (e) {
+                    console.error('[Preview] WebRTC error:', e);
+                }
+
+            // ── Preview ICE candidate from phone ──────────────────────────
+            } else if (msg.type === 'preview-ice-candidate') {
+                if (previewPcRef.current) {
+                    try {
+                        await previewPcRef.current.addIceCandidate(new RTCIceCandidate({
+                            candidate: msg.candidate,
+                            sdpMid: msg.sdp_mid,
+                            sdpMLineIndex: msg.sdp_m_line_index,
+                        }));
+                    } catch {}
+                }
             }
         };
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [startStatsPolling]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
         connectWebSocket();
         return () => {
             if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
+            previewPcRef.current?.close();
             wsRef.current?.close();
         };
     }, [connectWebSocket]);
 
-    // ── Stats polling ───────────────────────────────────────────────────────
-    const startStatsPolling = (pc: RTCPeerConnection) => {
-        if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-        prevBytesRef.current = null;
-
-        statsIntervalRef.current = window.setInterval(async () => {
-            const stats = await pc.getStats();
-            stats.forEach((report) => {
-                if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                    const resolution = `${report.frameWidth || 0}x${report.frameHeight || 0}`;
-                    const fps = Math.round(report.framesPerSecond || 0);
-
-                    // Delta-based bitrate (kbps)
-                    const nowBytes: number = report.bytesReceived ?? 0;
-                    const nowTs = Date.now();
-                    let bitrate = 0;
-                    if (prevBytesRef.current) {
-                        const deltaBits = (nowBytes - prevBytesRef.current.bytes) * 8;
-                        const deltaSec = (nowTs - prevBytesRef.current.ts) / 1000;
-                        if (deltaSec > 0) bitrate = Math.round(deltaBits / 1000 / deltaSec);
-                    }
-                    prevBytesRef.current = { bytes: nowBytes, ts: nowTs };
-
-                    setConnectionStats(prev => ({ ...prev, resolution, fps, bitrate }));
-                }
-                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                    const rtt = report.currentRoundTripTime;
-                    if (rtt != null) {
-                        setConnectionStats(prev => ({
-                            ...prev,
-                            latency: Math.round(rtt * 1000),
-                        }));
-                    }
-                }
-            });
-        }, 1000);
-    };
-
-    // ── Virtual camera loopback preview ────────────────────────────────────
-    const startPreview = async () => {
-        try {
-            await new Promise(r => setTimeout(r, 1200));
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const vcam = devices.find(d => d.label.toLowerCase().includes('opticlink'));
-            if (vcam) {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { deviceId: { exact: vcam.deviceId } },
-                });
-                if (videoRef.current) {
-                    videoRef.current.srcObject = stream;
-                    videoRef.current.muted = true;
-                    setConnectionStats(prev => ({ ...prev, status: 'live' }));
-                    // Fake stats polling on the MediaStream track
-                    const [track] = stream.getVideoTracks();
-                    const pollStats = () => {
-                        const settings = track.getSettings();
-                        if (settings.width && settings.height) {
-                            setConnectionStats(prev => ({
-                                ...prev,
-                                resolution: `${settings.width}x${settings.height}`,
-                                fps: settings.frameRate ? Math.round(settings.frameRate) : prev.fps,
-                            }));
-                        }
-                    };
-                    pollStats();
-                    statsIntervalRef.current = window.setInterval(pollStats, 2000);
-                }
-            } else {
-                console.warn('[Preview] OpticLink Virtual Camera not found');
-            }
-        } catch (e) {
-            console.error('[Preview] Error:', e);
-        }
-    };
-
-    const stopPreview = () => {
-        if (statsIntervalRef.current) {
-            clearInterval(statsIntervalRef.current);
-            statsIntervalRef.current = null;
-        }
-        if (videoRef.current?.srcObject) {
-            const stream = videoRef.current.srcObject as MediaStream;
-            stream.getTracks().forEach(t => t.stop());
-            videoRef.current.srcObject = null;
-        }
-        setConnectionStats(prev => ({
-            ...prev,
-            status: connectedDevices.length > 0 ? 'connected' : 'disconnected',
-        }));
-    };
-
+    // ── Virtual camera toggle (separate from preview) ─────────────────────
     const toggleVirtualCam = async () => {
         try {
             if (virtualCamActive) {
                 await invoke('stop_virtual_cam');
                 setVirtualCamActive(false);
-                stopPreview();
                 toast.show('Virtual Camera stopped', 'info');
             } else {
                 await invoke('start_virtual_cam');
                 setVirtualCamActive(true);
                 toast.show('Virtual Camera started', 'success');
-                startPreview();
             }
         } catch (e) {
             console.error('[VCam] Toggle error:', e);
-            toast.show('Failed to toggle Virtual Camera', 'error');
+            toast.show('Virtual Camera not available on this system', 'error');
         }
     };
 

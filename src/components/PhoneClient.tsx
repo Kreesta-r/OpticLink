@@ -23,14 +23,21 @@ function formatDuration(seconds: number): string {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+const ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+];
+
 export default function PhoneClient() {
     const videoRef = useRef<HTMLVideoElement>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
-    const pcRef = useRef<RTCPeerConnection | null>(null);
+    const pcRef = useRef<RTCPeerConnection | null>(null);       // vcam PC
+    const previewPcRef = useRef<RTCPeerConnection | null>(null); // preview PC
     const answeredRef = useRef(false);
     const timeoutRef = useRef<number | null>(null);
     const durationRef = useRef<number | null>(null);
+    const helloIntervalRef = useRef<number | null>(null);
 
     const [status, setStatus] = useState<Status>('idle');
     const [errorMsg, setErrorMsg] = useState('');
@@ -42,7 +49,6 @@ export default function PhoneClient() {
 
     // ── Camera initialisation ──────────────────────────────────────────────
     const startCamera = useCallback(async (facing: FacingMode = 'environment') => {
-        // Stop existing stream
         streamRef.current?.getTracks().forEach(t => t.stop());
         streamRef.current = null;
         setTorchOn(false);
@@ -62,7 +68,6 @@ export default function PhoneClient() {
             try {
                 stream = await navigator.mediaDevices.getUserMedia(constraints);
             } catch {
-                // Fallback: any camera
                 stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
             }
 
@@ -73,7 +78,6 @@ export default function PhoneClient() {
                 videoRef.current.play().catch(() => {});
             }
 
-            // Check torch support
             const [track] = stream.getVideoTracks();
             const caps = track.getCapabilities?.() as any;
             if (caps?.torch) setTorchSupported(true);
@@ -109,17 +113,36 @@ export default function PhoneClient() {
     const flipCamera = useCallback(async () => {
         const newFacing: FacingMode = facingMode === 'environment' ? 'user' : 'environment';
         setFacingMode(newFacing);
-        // If streaming, we cannot change mid-stream without renegotiation; just switch camera
         await startCamera(newFacing);
-        // If streaming, replace the track on the peer connection
-        if (pcRef.current && streamRef.current) {
+        if (streamRef.current) {
             const [newTrack] = streamRef.current.getVideoTracks();
-            const sender = pcRef.current.getSenders().find(s => s.track?.kind === 'video');
-            if (sender && newTrack) {
-                sender.replaceTrack(newTrack).catch(console.error);
+            if (newTrack) {
+                // Replace on vcam PC
+                const vcamSender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
+                if (vcamSender) vcamSender.replaceTrack(newTrack).catch(console.error);
+                // Replace on preview PC
+                const previewSender = previewPcRef.current?.getSenders().find(s => s.track?.kind === 'video');
+                if (previewSender) previewSender.replaceTrack(newTrack).catch(console.error);
             }
         }
     }, [facingMode, startCamera]);
+
+    // ── Codec preference helper ────────────────────────────────────────────
+    const applyH264Preference = (pc: RTCPeerConnection) => {
+        try {
+            const transceivers = pc.getTransceivers().filter(t => t.sender.track?.kind === 'video');
+            const caps = RTCRtpSender.getCapabilities?.('video');
+            if (transceivers.length > 0 && caps?.codecs?.length) {
+                const order = ['video/H264', 'video/VP8', 'video/VP9', 'video/AV1'];
+                const sorted = [...caps.codecs].sort((a, b) => {
+                    const ia = order.indexOf(a.mimeType);
+                    const ib = order.indexOf(b.mimeType);
+                    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+                });
+                transceivers[0].setCodecPreferences?.(sorted);
+            }
+        } catch {}
+    };
 
     // ── Signaling ─────────────────────────────────────────────────────────
     const connectSignaling = useCallback(() => {
@@ -127,7 +150,7 @@ export default function PhoneClient() {
         wsRef.current = ws;
 
         ws.onopen = () => {
-            ws.send(JSON.stringify({
+            const helloMsg = JSON.stringify({
                 type: 'phone-hello',
                 deviceName: (() => {
                     const ua = navigator.userAgent;
@@ -135,9 +158,17 @@ export default function PhoneClient() {
                     return match?.[1]?.split(';')[0]?.trim() || 'Mobile Device';
                 })(),
                 platform: navigator.platform || 'unknown',
-            }));
+            });
+
+            ws.send(helloMsg);
             setWsReady(true);
             setStatus(s => (s === 'idle' || s === 'error' ? 'ready' : s));
+
+            // Re-broadcast every 5 s so the desktop catches it even if it connects late
+            if (helloIntervalRef.current) clearInterval(helloIntervalRef.current);
+            helloIntervalRef.current = window.setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) ws.send(helloMsg);
+            }, 5000);
         };
 
         ws.onerror = () => {
@@ -145,8 +176,11 @@ export default function PhoneClient() {
         };
 
         ws.onclose = () => {
+            if (helloIntervalRef.current) {
+                clearInterval(helloIntervalRef.current);
+                helloIntervalRef.current = null;
+            }
             setWsReady(false);
-            // Auto-reconnect after 3s unless streaming
             setTimeout(() => {
                 if (status !== 'streaming') connectSignaling();
             }, 3000);
@@ -156,7 +190,8 @@ export default function PhoneClient() {
             let msg: any;
             try { msg = JSON.parse(event.data); } catch { return; }
 
-            if (msg.type === 'answer') {
+            // ── vcam answer ────────────────────────────────────────────────
+            if (msg.type === 'answer' && !msg.for) {
                 try {
                     answeredRef.current = true;
                     if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
@@ -171,10 +206,33 @@ export default function PhoneClient() {
                     setStatus('error');
                     setErrorMsg('Invalid response from desktop. Try again.');
                 }
-            } else if (msg.type === 'ice-candidate') {
+            // ── preview answer ─────────────────────────────────────────────
+            } else if (msg.type === 'preview-answer') {
+                try {
+                    if (previewPcRef.current) {
+                        await previewPcRef.current.setRemoteDescription(
+                            new RTCSessionDescription({ type: 'answer', sdp: msg.sdp })
+                        );
+                    }
+                } catch (e) {
+                    console.error('[Preview] setRemoteDescription error:', e);
+                }
+            // ── vcam ICE candidate ─────────────────────────────────────────
+            } else if (msg.type === 'ice-candidate' && msg.from !== 'preview') {
                 if (pcRef.current) {
                     try {
                         await pcRef.current.addIceCandidate(new RTCIceCandidate({
+                            candidate: msg.candidate,
+                            sdpMid: msg.sdp_mid,
+                            sdpMLineIndex: msg.sdp_m_line_index,
+                        }));
+                    } catch {}
+                }
+            // ── preview ICE candidate ──────────────────────────────────────
+            } else if (msg.type === 'preview-ice-candidate') {
+                if (previewPcRef.current) {
+                    try {
+                        await previewPcRef.current.addIceCandidate(new RTCIceCandidate({
                             candidate: msg.candidate,
                             sdpMid: msg.sdp_mid,
                             sdpMLineIndex: msg.sdp_m_line_index,
@@ -206,8 +264,10 @@ export default function PhoneClient() {
             streamRef.current?.getTracks().forEach(t => t.stop());
             wsRef.current?.close();
             pcRef.current?.close();
+            previewPcRef.current?.close();
             if (timeoutRef.current) clearTimeout(timeoutRef.current);
             if (durationRef.current) clearInterval(durationRef.current);
+            if (helloIntervalRef.current) clearInterval(helloIntervalRef.current);
         };
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -229,54 +289,35 @@ export default function PhoneClient() {
         answeredRef.current = false;
 
         try {
-            const pc = new RTCPeerConnection({
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                ],
-            });
-            pcRef.current = pc;
+            // ── Vcam peer connection (for Rust virtual camera) ─────────────
+            const vcamPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+            pcRef.current = vcamPc;
 
-            // Add camera tracks
-            streamRef.current!.getTracks().forEach(track => pc.addTrack(track, streamRef.current!));
+            streamRef.current!.getTracks().forEach(track =>
+                vcamPc.addTrack(track, streamRef.current!)
+            );
+            applyH264Preference(vcamPc);
 
-            // Prefer H.264 for virtual camera compatibility
-            try {
-                const transceivers = pc.getTransceivers().filter(
-                    t => t.sender.track?.kind === 'video'
-                );
-                const caps = RTCRtpSender.getCapabilities?.('video');
-                if (transceivers.length > 0 && caps?.codecs?.length) {
-                    const order = ['video/H264', 'video/VP8', 'video/VP9', 'video/AV1'];
-                    const sorted = [...caps.codecs].sort((a, b) => {
-                        const ia = order.indexOf(a.mimeType);
-                        const ib = order.indexOf(b.mimeType);
-                        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-                    });
-                    transceivers[0].setCodecPreferences?.(sorted);
-                }
-            } catch {}
-
-            pc.onicecandidate = (event) => {
+            vcamPc.onicecandidate = (event) => {
                 if (event.candidate) {
                     wsRef.current?.send(JSON.stringify({
                         type: 'ice-candidate',
                         candidate: event.candidate.candidate,
                         sdp_mid: event.candidate.sdpMid,
                         sdp_m_line_index: event.candidate.sdpMLineIndex,
-                        target: 'desktop',
+                        from: 'vcam',
                     }));
                 }
             };
 
-            pc.onconnectionstatechange = () => {
-                if (pc.connectionState === 'connected') {
+            vcamPc.onconnectionstatechange = () => {
+                if (vcamPc.connectionState === 'connected') {
                     answeredRef.current = true;
                     if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
                 }
                 if (
-                    (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') &&
-                    pcRef.current === pc
+                    (vcamPc.connectionState === 'failed' || vcamPc.connectionState === 'disconnected') &&
+                    pcRef.current === vcamPc
                 ) {
                     setStatus('error');
                     setErrorMsg('Connection lost. Check that both devices are on the same Wi-Fi.');
@@ -284,23 +325,48 @@ export default function PhoneClient() {
                 }
             };
 
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-
+            const vcamOffer = await vcamPc.createOffer();
+            await vcamPc.setLocalDescription(vcamOffer);
             wsRef.current?.send(JSON.stringify({
                 type: 'offer',
-                sdp: offer.sdp,
-                target: 'desktop',
+                sdp: vcamOffer.sdp,
             }));
 
-            // 15s timeout waiting for answer
+            // ── Preview peer connection (for desktop preview) ──────────────
+            const previewPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+            previewPcRef.current = previewPc;
+
+            streamRef.current!.getTracks().forEach(track =>
+                previewPc.addTrack(track, streamRef.current!)
+            );
+            applyH264Preference(previewPc);
+
+            previewPc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    wsRef.current?.send(JSON.stringify({
+                        type: 'preview-ice-candidate',
+                        candidate: event.candidate.candidate,
+                        sdp_mid: event.candidate.sdpMid,
+                        sdp_m_line_index: event.candidate.sdpMLineIndex,
+                    }));
+                }
+            };
+
+            const previewOffer = await previewPc.createOffer();
+            await previewPc.setLocalDescription(previewOffer);
+            wsRef.current?.send(JSON.stringify({
+                type: 'preview-offer',
+                sdp: previewOffer.sdp,
+            }));
+
+            // ── Timeout waiting for vcam answer ────────────────────────────
             timeoutRef.current = window.setTimeout(() => {
-                if (!answeredRef.current && pcRef.current === pc) {
+                if (!answeredRef.current && pcRef.current === vcamPc) {
                     setStatus('error');
                     setErrorMsg(
-                        'No response from desktop. Make sure Virtual Camera is started on the desktop app, and both devices are on the same Wi-Fi.'
+                        'No response from desktop. Make sure OpticLink is running and both devices are on the same Wi-Fi.'
                     );
-                    pc.close();
+                    vcamPc.close();
                     pcRef.current = null;
                 }
             }, 15000);
@@ -314,6 +380,8 @@ export default function PhoneClient() {
     const stopStream = () => {
         pcRef.current?.close();
         pcRef.current = null;
+        previewPcRef.current?.close();
+        previewPcRef.current = null;
         stopDurationTimer();
         setStatus('ready');
     };
@@ -448,7 +516,7 @@ export default function PhoneClient() {
 
                 {status === 'ready' && wsReady && (
                     <p className="phone-tip">
-                        Start Virtual Cam on desktop first, then tap Start Streaming
+                        Tap Start Streaming to send your camera to the desktop
                     </p>
                 )}
                 {status === 'ready' && !wsReady && (
