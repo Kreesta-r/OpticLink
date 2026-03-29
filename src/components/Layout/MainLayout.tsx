@@ -160,11 +160,28 @@ export default function MainLayout() {
 
         setConnectionStats(prev => ({ ...prev, status: 'live' }));
 
-        // Stats polling using video element metrics
+        // Stats + seek-to-live + buffer trimming
         let lastFrames = 0;
         statsIntervalRef.current = window.setInterval(() => {
             const v = videoRef.current;
+            const sb = sbRef.current;
             if (!v) return;
+
+            // ── Seek to live edge if we're falling behind ───────────────
+            if (sb && sb.buffered.length > 0) {
+                const bufEnd = sb.buffered.end(sb.buffered.length - 1);
+                const bufStart = sb.buffered.start(0);
+                // If video is >1.5s behind buffer end, jump to near-live
+                if (bufEnd - v.currentTime > 1.5) {
+                    v.currentTime = bufEnd - 0.2;
+                }
+                // Trim buffer older than 8s to prevent QuotaExceededError
+                if (!sb.updating && bufEnd - bufStart > 8) {
+                    try { sb.remove(bufStart, bufEnd - 6); } catch {}
+                }
+            }
+
+            // ── Stats ────────────────────────────────────────────────────
             const w = v.videoWidth;
             const h = v.videoHeight;
             const quality = (v as any).getVideoPlaybackQuality?.();

@@ -189,11 +189,10 @@ export default function PhoneClient() {
                             new RTCSessionDescription({ type: 'answer', sdp: msg.sdp })
                         );
                     }
-                    setStatus('streaming');
-                    startDurationTimer();
-                } catch {
-                    setStatus('error');
-                    setErrorMsg('Invalid response from desktop. Try again.');
+                    // vcam connected — preview relay is already running
+                } catch (e) {
+                    // vcam SDP error is non-fatal — preview relay still works
+                    console.warn('[vcam] setRemoteDescription error (non-fatal):', e);
                 }
 
             // vcam ICE candidates from Rust
@@ -317,7 +316,7 @@ export default function PhoneClient() {
 
                     const recorder = new MediaRecorder(streamRef.current, {
                         mimeType,
-                        videoBitsPerSecond: 800_000,
+                        videoBitsPerSecond: 1_500_000,
                     });
 
                     recorder.ondataavailable = (e) => {
@@ -330,7 +329,7 @@ export default function PhoneClient() {
                         console.error('[Recorder] error:', e);
                     };
 
-                    recorder.start(250); // 250 ms chunks ≈ ~250 ms latency
+                    recorder.start(100); // 100 ms chunks ≈ ~100 ms latency
                     recorderRef.current = recorder;
                 } catch (recErr) {
                     console.warn('[Preview] MediaRecorder failed:', recErr);
