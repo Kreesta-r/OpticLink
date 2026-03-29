@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use warp::Filter;
 use futures::{StreamExt, SinkExt};
-use windows::Win32::Media::MediaFoundation::IMFVirtualCamera;
+use windows::Win32::Media::MediaFoundation::{IMFVirtualCamera, IMFMediaSource};
 
 mod virtual_cam;
 mod media_stream;
@@ -23,11 +23,16 @@ struct SendVirtualCamera(IMFVirtualCamera);
 unsafe impl Send for SendVirtualCamera {}
 unsafe impl Sync for SendVirtualCamera {}
 
+struct SendIMFMediaSource(IMFMediaSource);
+unsafe impl Send for SendIMFMediaSource {}
+unsafe impl Sync for SendIMFMediaSource {}
+
 struct VirtualCamState {
     active: bool,
     frames_processed: u64,
     sink: Option<OpticLinkFrameSink>,
     _cam: Option<SendVirtualCamera>,
+    _source: Option<SendIMFMediaSource>,
 }
 
 static VCAM_STATE: LazyLock<Mutex<VirtualCamState>> = LazyLock::new(|| {
@@ -36,6 +41,7 @@ static VCAM_STATE: LazyLock<Mutex<VirtualCamState>> = LazyLock::new(|| {
         frames_processed: 0,
         sink: None,
         _cam: None,
+        _source: None,
     })
 });
 
@@ -62,10 +68,18 @@ async fn start_virtual_cam() -> Result<(), String> {
 
     println!("[VCam] Registering Virtual Camera...");
     let (source, sink) = OpticLinkMediaSource::new().map_err(|e| e.to_string())?;
-    let cam = register_virtual_camera(&source).map_err(|e| e.to_string())?;
+    let cam = register_virtual_camera(&source).map_err(|e| {
+        format!(
+            "MFCreateVirtualCamera failed: {}. \
+             Virtual Camera requires Windows 11 build 22000+ and a registered COM server. \
+             This feature needs additional system setup — see the docs for details.",
+            e
+        )
+    })?;
 
     state.sink = Some(sink);
     state._cam = Some(SendVirtualCamera(cam));
+    state._source = Some(SendIMFMediaSource(source));
     state.active = true;
     state.frames_processed = 0;
 
@@ -83,6 +97,7 @@ async fn stop_virtual_cam() -> Result<(), String> {
     println!("[VCam] Stopping Virtual Camera...");
     state.sink = None;
     state._cam = None;
+    state._source = None;
     state.active = false;
     println!("[VCam] Virtual Camera stopped.");
     Ok(())
@@ -144,6 +159,15 @@ async fn user_connected(ws: warp::ws::WebSocket, users: Users) {
             for (&uid, tx) in users_lock.iter() {
                 if uid != my_id {
                     let _ = tx.send(warp::ws::Message::text(text));
+                }
+            }
+        } else if msg.is_binary() {
+            // Binary messages are video preview chunks from phone — relay to desktop
+            let data = msg.into_bytes();
+            let users_lock = users.lock().unwrap();
+            for (&uid, tx) in users_lock.iter() {
+                if uid != my_id {
+                    let _ = tx.send(warp::ws::Message::binary(data.clone()));
                 }
             }
         }

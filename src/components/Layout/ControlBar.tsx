@@ -24,7 +24,9 @@ export default function ControlBar({
                 <button
                     className={`btn ${virtualCamActive ? 'btn-danger' : 'btn-primary'}`}
                     onClick={onToggleVirtualCam}
-                    title={virtualCamActive ? 'Stop Virtual Camera' : 'Start Virtual Camera'}
+                    title={virtualCamActive
+                        ? 'Stop Virtual Camera — removes OpticLink from your system camera list'
+                        : 'Start Virtual Camera — makes your phone camera appear as a webcam in Zoom, Teams, OBS, etc. (Requires Windows 11 build 22000+)'}
                 >
                     {virtualCamActive
                         ? <><IconCameraOff size={15} /> Stop Virtual Cam</>
@@ -56,8 +58,8 @@ export default function ControlBar({
                     {virtualCamActive && <span className="status-dot connected" />}
                     {virtualCamActive
                         ? 'Virtual Camera Active'
-                        : connectedCount > 0
-                            ? 'Start Virtual Cam before streaming'
+                        : isLive
+                            ? 'Preview live via Wi-Fi relay'
                             : 'Virtual Camera Off'}
                 </span>
 

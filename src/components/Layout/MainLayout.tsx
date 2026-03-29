@@ -39,12 +39,22 @@ export default function MainLayout() {
     const videoRef = useRef<HTMLVideoElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const statsIntervalRef = useRef<number | null>(null);
-    // Track previous bytesReceived for delta-based bitrate
-    const prevBytesRef = useRef<{ bytes: number; ts: number } | null>(null);
+
+    // MSE (Media Source Extensions) refs for WebSocket-relay preview
+    const msRef = useRef<MediaSource | null>(null);
+    const sbRef = useRef<SourceBuffer | null>(null);
+    const pendingChunksRef = useRef<ArrayBuffer[]>([]);
+    const chunkBytesRef = useRef<number>(0);  // bytes received this second (for bitrate)
+
+    // Keep connectedDevices accessible in stale closures
+    const connectedDevicesRef = useRef(connectedDevices);
+    connectedDevicesRef.current = connectedDevices;
 
     const toast = useToast();
+    const toastShowRef = useRef(toast.show);
+    toastShowRef.current = toast.show;
 
-    // ── Loading screen: dismiss after 1 s ──────────────────────────────────
+    // ── Loading screen ──────────────────────────────────────────────────────
     useEffect(() => {
         const t = setTimeout(() => setShowLoading(false), 1000);
         return () => clearTimeout(t);
@@ -73,7 +83,150 @@ export default function MainLayout() {
         return () => clearInterval(interval);
     }, []);
 
-    // ── WebSocket ───────────────────────────────────────────────────────────
+    // ── Drain MSE queue ─────────────────────────────────────────────────────
+    const drainMSE = useCallback(() => {
+        const sb = sbRef.current;
+        if (!sb || sb.updating || pendingChunksRef.current.length === 0) return;
+        try {
+            sb.appendBuffer(pendingChunksRef.current.shift()!);
+        } catch (e: any) {
+            if (e?.name === 'QuotaExceededError') {
+                // Remove oldest ~10s of buffered data to make room
+                if (sb.buffered.length > 0) {
+                    try { sb.remove(sb.buffered.start(0), sb.buffered.start(0) + 10); } catch {}
+                }
+            } else {
+                pendingChunksRef.current = []; // clear on other errors
+            }
+        }
+    }, []);
+
+    // ── Append a binary chunk to MSE ────────────────────────────────────────
+    const appendChunk = useCallback((buffer: ArrayBuffer) => {
+        chunkBytesRef.current += buffer.byteLength;
+        pendingChunksRef.current.push(buffer);
+
+        // Cap queue to ~30 chunks to prevent unbounded memory growth
+        while (pendingChunksRef.current.length > 30) pendingChunksRef.current.shift();
+
+        drainMSE();
+    }, [drainMSE]);
+
+    // ── Start MSE-based preview ─────────────────────────────────────────────
+    const initPreviewMSE = useCallback((mimeType: string) => {
+        // Clean up any existing MSE session
+        if (statsIntervalRef.current) {
+            clearInterval(statsIntervalRef.current);
+            statsIntervalRef.current = null;
+        }
+        sbRef.current = null;
+        pendingChunksRef.current = [];
+        chunkBytesRef.current = 0;
+
+        if (!('MediaSource' in window)) {
+            console.warn('[Preview] MediaSource not supported');
+            return;
+        }
+        if (!MediaSource.isTypeSupported(mimeType)) {
+            console.warn('[Preview] Unsupported MIME type:', mimeType);
+            // Try a fallback
+            const fallback = 'video/webm; codecs=vp8';
+            if (mimeType !== fallback && MediaSource.isTypeSupported(fallback)) {
+                initPreviewMSE(fallback);
+            }
+            return;
+        }
+
+        const ms = new MediaSource();
+        msRef.current = ms;
+        const url = URL.createObjectURL(ms);
+
+        ms.addEventListener('sourceopen', () => {
+            try {
+                const sb = ms.addSourceBuffer(mimeType);
+                sbRef.current = sb;
+                sb.addEventListener('updateend', drainMSE);
+                // Flush anything already queued
+                drainMSE();
+            } catch (e) {
+                console.error('[MSE] addSourceBuffer error:', e);
+            }
+        }, { once: true });
+
+        if (videoRef.current) {
+            videoRef.current.src = url;
+            videoRef.current.play().catch(() => {});
+        }
+
+        setConnectionStats(prev => ({ ...prev, status: 'live' }));
+
+        // Stats + seek-to-live + buffer trimming
+        let lastFrames = 0;
+        statsIntervalRef.current = window.setInterval(() => {
+            const v = videoRef.current;
+            const sb = sbRef.current;
+            if (!v) return;
+
+            // ── Seek to live edge if we're falling behind ───────────────
+            if (sb && sb.buffered.length > 0) {
+                const bufEnd = sb.buffered.end(sb.buffered.length - 1);
+                const bufStart = sb.buffered.start(0);
+                // If video is >1.5s behind buffer end, jump to near-live
+                if (bufEnd - v.currentTime > 1.5) {
+                    v.currentTime = bufEnd - 0.2;
+                }
+                // Trim buffer older than 8s to prevent QuotaExceededError
+                if (!sb.updating && bufEnd - bufStart > 8) {
+                    try { sb.remove(bufStart, bufEnd - 6); } catch {}
+                }
+            }
+
+            // ── Stats ────────────────────────────────────────────────────
+            const w = v.videoWidth;
+            const h = v.videoHeight;
+            const quality = (v as any).getVideoPlaybackQuality?.();
+            const totalFrames = quality?.totalVideoFrames ?? 0;
+            const fps = Math.max(0, totalFrames - lastFrames);
+            lastFrames = totalFrames;
+
+            const bytes = chunkBytesRef.current;
+            chunkBytesRef.current = 0;
+
+            setConnectionStats(prev => ({
+                ...prev,
+                ...(w && h ? { resolution: `${w}x${h}`, fps } : {}),
+                bitrate: Math.round(bytes * 8 / 1000),
+                latency: 0,
+            }));
+        }, 1000);
+    }, [drainMSE]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── Stop preview ────────────────────────────────────────────────────────
+    const stopPreview = useCallback(() => {
+        if (statsIntervalRef.current) {
+            clearInterval(statsIntervalRef.current);
+            statsIntervalRef.current = null;
+        }
+        sbRef.current = null;
+        msRef.current = null;
+        pendingChunksRef.current = [];
+
+        if (videoRef.current) {
+            videoRef.current.src = '';
+            videoRef.current.srcObject = null;
+        }
+
+        setConnectionStats(prev => ({
+            ...prev,
+            status: connectedDevicesRef.current.length > 0 ? 'connected' : 'disconnected',
+            fps: 0,
+            bitrate: 0,
+            resolution: '-',
+            latency: 0,
+        }));
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── WebSocket signaling ─────────────────────────────────────────────────
     const connectWebSocket = useCallback(() => {
         setConnectionStats(prev => ({ ...prev, status: 'connecting' }));
 
@@ -100,7 +253,14 @@ export default function MainLayout() {
             setConnectionStats(prev => ({ ...prev, status: 'disconnected' }));
         };
 
-        ws.onmessage = (event) => {
+        ws.onmessage = async (event) => {
+            // ── Binary message = video preview chunk ──────────────────────
+            if (event.data instanceof Blob) {
+                const buffer = await event.data.arrayBuffer();
+                appendChunk(buffer);
+                return;
+            }
+
             let msg: any;
             try {
                 msg = JSON.parse(event.data as string);
@@ -108,11 +268,13 @@ export default function MainLayout() {
                 return;
             }
 
+            // ── Phone connected ────────────────────────────────────────────
             if (msg.type === 'phone-hello') {
                 const id = (msg.deviceName || 'device') + (msg.platform || '');
                 setConnectedDevices(prev => {
                     if (prev.some(d => d.id === id)) return prev;
-                    const newList = [
+                    toastShowRef.current(`${msg.deviceName || 'Phone'} connected`, 'success');
+                    return [
                         ...prev,
                         {
                             id,
@@ -120,13 +282,11 @@ export default function MainLayout() {
                             platform: msg.platform || '',
                         },
                     ];
-                    return newList;
                 });
                 setConnectionStats(prev => ({
                     ...prev,
                     status: prev.status === 'live' ? 'live' : 'connected',
                 }));
-                toast.show(`${msg.deviceName || 'Phone'} connected`, 'success');
 
                 // Auto-start virtual cam when phone connects (if setting enabled)
                 try {
@@ -139,12 +299,24 @@ export default function MainLayout() {
                         }
                     }
                 } catch {}
+
+            // ── Phone disconnected ────────────────────────────────────────
             } else if (msg.type === 'client-disconnect') {
                 setConnectedDevices(prev => prev.filter(d => d.id !== msg.clientId));
-                toast.show('Phone disconnected', 'info');
+                toastShowRef.current('Phone disconnected', 'info');
+                stopPreview();
+
+            // ── Preview stream starting ───────────────────────────────────
+            } else if (msg.type === 'preview-start') {
+                const mimeType: string = msg.mimeType || 'video/webm; codecs=vp8';
+                initPreviewMSE(mimeType);
+
+            // ── Preview stream stopping ───────────────────────────────────
+            } else if (msg.type === 'preview-stop') {
+                stopPreview();
             }
         };
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [appendChunk, initPreviewMSE, stopPreview]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
         connectWebSocket();
@@ -154,113 +326,32 @@ export default function MainLayout() {
         };
     }, [connectWebSocket]);
 
-    // ── Stats polling ───────────────────────────────────────────────────────
-    const startStatsPolling = (pc: RTCPeerConnection) => {
-        if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-        prevBytesRef.current = null;
-
-        statsIntervalRef.current = window.setInterval(async () => {
-            const stats = await pc.getStats();
-            stats.forEach((report) => {
-                if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                    const resolution = `${report.frameWidth || 0}x${report.frameHeight || 0}`;
-                    const fps = Math.round(report.framesPerSecond || 0);
-
-                    // Delta-based bitrate (kbps)
-                    const nowBytes: number = report.bytesReceived ?? 0;
-                    const nowTs = Date.now();
-                    let bitrate = 0;
-                    if (prevBytesRef.current) {
-                        const deltaBits = (nowBytes - prevBytesRef.current.bytes) * 8;
-                        const deltaSec = (nowTs - prevBytesRef.current.ts) / 1000;
-                        if (deltaSec > 0) bitrate = Math.round(deltaBits / 1000 / deltaSec);
-                    }
-                    prevBytesRef.current = { bytes: nowBytes, ts: nowTs };
-
-                    setConnectionStats(prev => ({ ...prev, resolution, fps, bitrate }));
-                }
-                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                    const rtt = report.currentRoundTripTime;
-                    if (rtt != null) {
-                        setConnectionStats(prev => ({
-                            ...prev,
-                            latency: Math.round(rtt * 1000),
-                        }));
-                    }
-                }
-            });
-        }, 1000);
-    };
-
-    // ── Virtual camera loopback preview ────────────────────────────────────
-    const startPreview = async () => {
-        try {
-            await new Promise(r => setTimeout(r, 1200));
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const vcam = devices.find(d => d.label.toLowerCase().includes('opticlink'));
-            if (vcam) {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { deviceId: { exact: vcam.deviceId } },
-                });
-                if (videoRef.current) {
-                    videoRef.current.srcObject = stream;
-                    videoRef.current.muted = true;
-                    setConnectionStats(prev => ({ ...prev, status: 'live' }));
-                    // Fake stats polling on the MediaStream track
-                    const [track] = stream.getVideoTracks();
-                    const pollStats = () => {
-                        const settings = track.getSettings();
-                        if (settings.width && settings.height) {
-                            setConnectionStats(prev => ({
-                                ...prev,
-                                resolution: `${settings.width}x${settings.height}`,
-                                fps: settings.frameRate ? Math.round(settings.frameRate) : prev.fps,
-                            }));
-                        }
-                    };
-                    pollStats();
-                    statsIntervalRef.current = window.setInterval(pollStats, 2000);
-                }
-            } else {
-                console.warn('[Preview] OpticLink Virtual Camera not found');
-            }
-        } catch (e) {
-            console.error('[Preview] Error:', e);
-        }
-    };
-
-    const stopPreview = () => {
-        if (statsIntervalRef.current) {
-            clearInterval(statsIntervalRef.current);
-            statsIntervalRef.current = null;
-        }
-        if (videoRef.current?.srcObject) {
-            const stream = videoRef.current.srcObject as MediaStream;
-            stream.getTracks().forEach(t => t.stop());
-            videoRef.current.srcObject = null;
-        }
-        setConnectionStats(prev => ({
-            ...prev,
-            status: connectedDevices.length > 0 ? 'connected' : 'disconnected',
-        }));
-    };
-
+    // ── Virtual camera toggle ─────────────────────────────────────────────
     const toggleVirtualCam = async () => {
         try {
             if (virtualCamActive) {
                 await invoke('stop_virtual_cam');
                 setVirtualCamActive(false);
-                stopPreview();
                 toast.show('Virtual Camera stopped', 'info');
             } else {
                 await invoke('start_virtual_cam');
                 setVirtualCamActive(true);
                 toast.show('Virtual Camera started', 'success');
-                startPreview();
             }
         } catch (e) {
             console.error('[VCam] Toggle error:', e);
-            toast.show('Failed to toggle Virtual Camera', 'error');
+            const errStr = String(e);
+            let msg: string;
+            if (errStr.includes('22000') || errStr.includes('Windows 11') || errStr.includes('REGDB') || errStr.includes('80040154')) {
+                msg = 'Virtual Camera requires Windows 11 build 22000+';
+            } else if (errStr.includes('not supported') || errStr.includes('C00D36D5')) {
+                msg = 'Virtual Camera is not supported on this system';
+            } else if (errStr.includes('COM') || errStr.includes('registered')) {
+                msg = 'Virtual Camera needs COM server setup — see the docs';
+            } else {
+                msg = `Virtual Camera error — ${errStr.slice(0, 60)}`;
+            }
+            toast.show(msg, 'error');
         }
     };
 
@@ -276,7 +367,6 @@ export default function MainLayout() {
                     status={connectionStats.status}
                     stats={connectionStats}
                     mirror={mirrorVideo}
-                    startStatsPolling={startStatsPolling}
                 />
             </div>
             <ControlBar

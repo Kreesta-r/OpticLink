@@ -14,7 +14,6 @@ interface PreviewPanelProps {
     status: 'disconnected' | 'connecting' | 'connected' | 'live';
     stats: ConnectionStats;
     mirror?: boolean;
-    startStatsPolling?: (pc: RTCPeerConnection) => void;
 }
 
 export default function PreviewPanel({ videoRef, status, stats, mirror = false }: PreviewPanelProps) {
@@ -96,7 +95,7 @@ export default function PreviewPanel({ videoRef, status, stats, mirror = false }
                                 {status === 'disconnected'
                                     ? 'Scan the QR code with your phone to get started'
                                     : status === 'connected'
-                                        ? 'Click Start Virtual Cam, then tap Start Streaming on your phone'
+                                        ? 'Tap Start Streaming on your phone to begin'
                                         : 'Waiting for stream...'}
                             </p>
                         </div>
