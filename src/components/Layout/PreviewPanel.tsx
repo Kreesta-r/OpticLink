@@ -14,7 +14,6 @@ interface PreviewPanelProps {
     status: 'disconnected' | 'connecting' | 'connected' | 'live';
     stats: ConnectionStats;
     mirror?: boolean;
-    startStatsPolling?: (pc: RTCPeerConnection) => void;
 }
 
 export default function PreviewPanel({ videoRef, status, stats, mirror = false }: PreviewPanelProps) {

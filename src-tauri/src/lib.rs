@@ -68,7 +68,14 @@ async fn start_virtual_cam() -> Result<(), String> {
 
     println!("[VCam] Registering Virtual Camera...");
     let (source, sink) = OpticLinkMediaSource::new().map_err(|e| e.to_string())?;
-    let cam = register_virtual_camera(&source).map_err(|e| e.to_string())?;
+    let cam = register_virtual_camera(&source).map_err(|e| {
+        format!(
+            "MFCreateVirtualCamera failed: {}. \
+             Virtual Camera requires Windows 11 build 22000+ and a registered COM server. \
+             This feature needs additional system setup — see the docs for details.",
+            e
+        )
+    })?;
 
     state.sink = Some(sink);
     state._cam = Some(SendVirtualCamera(cam));
@@ -152,6 +159,15 @@ async fn user_connected(ws: warp::ws::WebSocket, users: Users) {
             for (&uid, tx) in users_lock.iter() {
                 if uid != my_id {
                     let _ = tx.send(warp::ws::Message::text(text));
+                }
+            }
+        } else if msg.is_binary() {
+            // Binary messages are video preview chunks from phone — relay to desktop
+            let data = msg.into_bytes();
+            let users_lock = users.lock().unwrap();
+            for (&uid, tx) in users_lock.iter() {
+                if uid != my_id {
+                    let _ = tx.send(warp::ws::Message::binary(data.clone()));
                 }
             }
         }

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import '../styles/theme.css';
 import './PhoneClient.css';
 
-// WebSocket URL dynamically uses WSS when page is HTTPS, matching the port
+// WebSocket URL — WSS when served over HTTPS (phone), WS otherwise
 const SIGNALING_SERVER =
     (window.location.protocol === 'https:' ? 'wss' : 'ws') +
     '://' +
@@ -12,7 +12,6 @@ const SIGNALING_SERVER =
     '/ws';
 
 type Status = 'idle' | 'ready' | 'connecting' | 'streaming' | 'error';
-
 type FacingMode = 'environment' | 'user';
 
 function formatDuration(seconds: number): string {
@@ -23,29 +22,42 @@ function formatDuration(seconds: number): string {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+/** Pick the best MIME type that MediaRecorder supports on this device. */
+function getSupportedMimeType(): string {
+    const candidates = [
+        'video/webm; codecs=vp9',
+        'video/webm; codecs=vp8',
+        'video/webm',
+    ];
+    for (const t of candidates) {
+        if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+}
+
 const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
 ];
 
 export default function PhoneClient() {
-    const videoRef = useRef<HTMLVideoElement>(null);
-    const streamRef = useRef<MediaStream | null>(null);
-    const wsRef = useRef<WebSocket | null>(null);
-    const pcRef = useRef<RTCPeerConnection | null>(null);       // vcam PC
-    const previewPcRef = useRef<RTCPeerConnection | null>(null); // preview PC
-    const answeredRef = useRef(false);
-    const timeoutRef = useRef<number | null>(null);
-    const durationRef = useRef<number | null>(null);
+    const videoRef       = useRef<HTMLVideoElement>(null);
+    const streamRef      = useRef<MediaStream | null>(null);
+    const wsRef          = useRef<WebSocket | null>(null);
+    const pcRef          = useRef<RTCPeerConnection | null>(null);   // vcam WebRTC (Rust)
+    const recorderRef    = useRef<MediaRecorder | null>(null);       // preview relay
+    const answeredRef    = useRef(false);
+    const timeoutRef     = useRef<number | null>(null);
+    const durationRef    = useRef<number | null>(null);
     const helloIntervalRef = useRef<number | null>(null);
 
-    const [status, setStatus] = useState<Status>('idle');
-    const [errorMsg, setErrorMsg] = useState('');
-    const [facingMode, setFacingMode] = useState<FacingMode>('environment');
-    const [torchOn, setTorchOn] = useState(false);
+    const [status, setStatus]             = useState<Status>('idle');
+    const [errorMsg, setErrorMsg]         = useState('');
+    const [facingMode, setFacingMode]     = useState<FacingMode>('environment');
+    const [torchOn, setTorchOn]           = useState(false);
     const [torchSupported, setTorchSupported] = useState(false);
-    const [duration, setDuration] = useState(0);
-    const [wsReady, setWsReady] = useState(false);
+    const [duration, setDuration]         = useState(0);
+    const [wsReady, setWsReady]           = useState(false);
 
     // ── Camera initialisation ──────────────────────────────────────────────
     const startCamera = useCallback(async (facing: FacingMode = 'environment') => {
@@ -117,32 +129,11 @@ export default function PhoneClient() {
         if (streamRef.current) {
             const [newTrack] = streamRef.current.getVideoTracks();
             if (newTrack) {
-                // Replace on vcam PC
-                const vcamSender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
-                if (vcamSender) vcamSender.replaceTrack(newTrack).catch(console.error);
-                // Replace on preview PC
-                const previewSender = previewPcRef.current?.getSenders().find(s => s.track?.kind === 'video');
-                if (previewSender) previewSender.replaceTrack(newTrack).catch(console.error);
+                const sender = pcRef.current?.getSenders().find(s => s.track?.kind === 'video');
+                if (sender) sender.replaceTrack(newTrack).catch(console.error);
             }
         }
     }, [facingMode, startCamera]);
-
-    // ── Codec preference helper ────────────────────────────────────────────
-    const applyH264Preference = (pc: RTCPeerConnection) => {
-        try {
-            const transceivers = pc.getTransceivers().filter(t => t.sender.track?.kind === 'video');
-            const caps = RTCRtpSender.getCapabilities?.('video');
-            if (transceivers.length > 0 && caps?.codecs?.length) {
-                const order = ['video/H264', 'video/VP8', 'video/VP9', 'video/AV1'];
-                const sorted = [...caps.codecs].sort((a, b) => {
-                    const ia = order.indexOf(a.mimeType);
-                    const ib = order.indexOf(b.mimeType);
-                    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-                });
-                transceivers[0].setCodecPreferences?.(sorted);
-            }
-        } catch {}
-    };
 
     // ── Signaling ─────────────────────────────────────────────────────────
     const connectSignaling = useCallback(() => {
@@ -171,9 +162,7 @@ export default function PhoneClient() {
             }, 5000);
         };
 
-        ws.onerror = () => {
-            setWsReady(false);
-        };
+        ws.onerror = () => { setWsReady(false); };
 
         ws.onclose = () => {
             if (helloIntervalRef.current) {
@@ -190,7 +179,7 @@ export default function PhoneClient() {
             let msg: any;
             try { msg = JSON.parse(event.data); } catch { return; }
 
-            // ── vcam answer ────────────────────────────────────────────────
+            // vcam answer from Rust WebRTC client
             if (msg.type === 'answer' && !msg.for) {
                 try {
                     answeredRef.current = true;
@@ -206,33 +195,12 @@ export default function PhoneClient() {
                     setStatus('error');
                     setErrorMsg('Invalid response from desktop. Try again.');
                 }
-            // ── preview answer ─────────────────────────────────────────────
-            } else if (msg.type === 'preview-answer') {
-                try {
-                    if (previewPcRef.current) {
-                        await previewPcRef.current.setRemoteDescription(
-                            new RTCSessionDescription({ type: 'answer', sdp: msg.sdp })
-                        );
-                    }
-                } catch (e) {
-                    console.error('[Preview] setRemoteDescription error:', e);
-                }
-            // ── vcam ICE candidate ─────────────────────────────────────────
-            } else if (msg.type === 'ice-candidate' && msg.from !== 'preview') {
+
+            // vcam ICE candidates from Rust
+            } else if (msg.type === 'ice-candidate') {
                 if (pcRef.current) {
                     try {
                         await pcRef.current.addIceCandidate(new RTCIceCandidate({
-                            candidate: msg.candidate,
-                            sdpMid: msg.sdp_mid,
-                            sdpMLineIndex: msg.sdp_m_line_index,
-                        }));
-                    } catch {}
-                }
-            // ── preview ICE candidate ──────────────────────────────────────
-            } else if (msg.type === 'preview-ice-candidate') {
-                if (previewPcRef.current) {
-                    try {
-                        await previewPcRef.current.addIceCandidate(new RTCIceCandidate({
                             candidate: msg.candidate,
                             sdpMid: msg.sdp_mid,
                             sdpMLineIndex: msg.sdp_m_line_index,
@@ -246,9 +214,7 @@ export default function PhoneClient() {
     const startDurationTimer = () => {
         setDuration(0);
         if (durationRef.current) clearInterval(durationRef.current);
-        durationRef.current = window.setInterval(() => {
-            setDuration(d => d + 1);
-        }, 1000);
+        durationRef.current = window.setInterval(() => setDuration(d => d + 1), 1000);
     };
 
     const stopDurationTimer = () => {
@@ -264,7 +230,7 @@ export default function PhoneClient() {
             streamRef.current?.getTracks().forEach(t => t.stop());
             wsRef.current?.close();
             pcRef.current?.close();
-            previewPcRef.current?.close();
+            recorderRef.current?.stop();
             if (timeoutRef.current) clearTimeout(timeoutRef.current);
             if (durationRef.current) clearInterval(durationRef.current);
             if (helloIntervalRef.current) clearInterval(helloIntervalRef.current);
@@ -289,14 +255,28 @@ export default function PhoneClient() {
         answeredRef.current = false;
 
         try {
-            // ── Vcam peer connection (for Rust virtual camera) ─────────────
+            // ── 1. vcam WebRTC peer connection (for Rust virtual camera) ───
             const vcamPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
             pcRef.current = vcamPc;
 
             streamRef.current!.getTracks().forEach(track =>
                 vcamPc.addTrack(track, streamRef.current!)
             );
-            applyH264Preference(vcamPc);
+
+            // Prefer H264 for the virtual camera pipeline (Rust assembler expects it)
+            try {
+                const transceivers = vcamPc.getTransceivers().filter(t => t.sender.track?.kind === 'video');
+                const caps = RTCRtpSender.getCapabilities?.('video');
+                if (transceivers.length > 0 && caps?.codecs?.length) {
+                    const order = ['video/H264', 'video/VP8', 'video/VP9', 'video/AV1'];
+                    const sorted = [...caps.codecs].sort((a, b) => {
+                        const ia = order.indexOf(a.mimeType);
+                        const ib = order.indexOf(b.mimeType);
+                        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+                    });
+                    transceivers[0].setCodecPreferences?.(sorted);
+                }
+            } catch {}
 
             vcamPc.onicecandidate = (event) => {
                 if (event.candidate) {
@@ -319,57 +299,60 @@ export default function PhoneClient() {
                     (vcamPc.connectionState === 'failed' || vcamPc.connectionState === 'disconnected') &&
                     pcRef.current === vcamPc
                 ) {
-                    setStatus('error');
-                    setErrorMsg('Connection lost. Check that both devices are on the same Wi-Fi.');
                     stopDurationTimer();
+                    // Don't show error — preview still works via WebSocket relay
                 }
             };
 
             const vcamOffer = await vcamPc.createOffer();
             await vcamPc.setLocalDescription(vcamOffer);
-            wsRef.current?.send(JSON.stringify({
-                type: 'offer',
-                sdp: vcamOffer.sdp,
-            }));
+            wsRef.current?.send(JSON.stringify({ type: 'offer', sdp: vcamOffer.sdp }));
 
-            // ── Preview peer connection (for desktop preview) ──────────────
-            const previewPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-            previewPcRef.current = previewPc;
+            // ── 2. Preview relay via MediaRecorder → WebSocket ────────────
+            const mimeType = getSupportedMimeType();
+            if (mimeType && streamRef.current) {
+                try {
+                    // Tell the desktop to expect a stream with this MIME type
+                    wsRef.current?.send(JSON.stringify({ type: 'preview-start', mimeType }));
 
-            streamRef.current!.getTracks().forEach(track =>
-                previewPc.addTrack(track, streamRef.current!)
-            );
-            applyH264Preference(previewPc);
+                    const recorder = new MediaRecorder(streamRef.current, {
+                        mimeType,
+                        videoBitsPerSecond: 800_000,
+                    });
 
-            previewPc.onicecandidate = (event) => {
-                if (event.candidate) {
-                    wsRef.current?.send(JSON.stringify({
-                        type: 'preview-ice-candidate',
-                        candidate: event.candidate.candidate,
-                        sdp_mid: event.candidate.sdpMid,
-                        sdp_m_line_index: event.candidate.sdpMLineIndex,
-                    }));
+                    recorder.ondataavailable = (e) => {
+                        if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+                            wsRef.current.send(e.data);
+                        }
+                    };
+
+                    recorder.onerror = (e) => {
+                        console.error('[Recorder] error:', e);
+                    };
+
+                    recorder.start(250); // 250 ms chunks ≈ ~250 ms latency
+                    recorderRef.current = recorder;
+                } catch (recErr) {
+                    console.warn('[Preview] MediaRecorder failed:', recErr);
+                    // Preview unavailable — vcam WebRTC still works
                 }
-            };
-
-            const previewOffer = await previewPc.createOffer();
-            await previewPc.setLocalDescription(previewOffer);
-            wsRef.current?.send(JSON.stringify({
-                type: 'preview-offer',
-                sdp: previewOffer.sdp,
-            }));
+            } else {
+                console.warn('[Preview] No supported MediaRecorder MIME type on this device');
+            }
 
             // ── Timeout waiting for vcam answer ────────────────────────────
             timeoutRef.current = window.setTimeout(() => {
                 if (!answeredRef.current && pcRef.current === vcamPc) {
-                    setStatus('error');
-                    setErrorMsg(
-                        'No response from desktop. Make sure OpticLink is running and both devices are on the same Wi-Fi.'
-                    );
-                    vcamPc.close();
-                    pcRef.current = null;
+                    // vcam timed out — that's OK as long as preview relay is working
+                    console.warn('[vcam] No answer from Rust WebRTC client after 15s');
+                    timeoutRef.current = null;
                 }
             }, 15000);
+
+            // Move status to streaming regardless — preview relay drives the feed
+            setStatus('streaming');
+            startDurationTimer();
+
         } catch (e: any) {
             setStatus('error');
             setErrorMsg(e instanceof Error ? e.message : 'Failed to start streaming.');
@@ -378,10 +361,17 @@ export default function PhoneClient() {
 
     // ── Stop streaming ────────────────────────────────────────────────────
     const stopStream = () => {
+        // Stop vcam WebRTC
         pcRef.current?.close();
         pcRef.current = null;
-        previewPcRef.current?.close();
-        previewPcRef.current = null;
+
+        // Stop preview relay
+        if (recorderRef.current) {
+            try { recorderRef.current.stop(); } catch {}
+            recorderRef.current = null;
+        }
+        wsRef.current?.send(JSON.stringify({ type: 'preview-stop' }));
+
         stopDurationTimer();
         setStatus('ready');
     };
@@ -391,12 +381,10 @@ export default function PhoneClient() {
         setErrorMsg('');
         setStatus('idle');
         await startCamera(facingMode);
-        if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            connectSignaling();
-        }
+        if (wsRef.current?.readyState !== WebSocket.OPEN) connectSignaling();
     };
 
-    // ── Status text ───────────────────────────────────────────────────────
+    // ── Status indicators ─────────────────────────────────────────────────
     const statusDotClass = status === 'streaming' ? 'live'
         : status === 'ready' ? 'connected'
         : status === 'connecting' ? 'connecting'

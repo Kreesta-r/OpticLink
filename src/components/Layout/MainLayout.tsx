@@ -38,16 +38,19 @@ export default function MainLayout() {
 
     const videoRef = useRef<HTMLVideoElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
-    const previewPcRef = useRef<RTCPeerConnection | null>(null);
     const statsIntervalRef = useRef<number | null>(null);
-    const prevBytesRef = useRef<{ bytes: number; ts: number } | null>(null);
+
+    // MSE (Media Source Extensions) refs for WebSocket-relay preview
+    const msRef = useRef<MediaSource | null>(null);
+    const sbRef = useRef<SourceBuffer | null>(null);
+    const pendingChunksRef = useRef<ArrayBuffer[]>([]);
+    const chunkBytesRef = useRef<number>(0);  // bytes received this second (for bitrate)
+
     // Keep connectedDevices accessible in stale closures
     const connectedDevicesRef = useRef(connectedDevices);
     connectedDevicesRef.current = connectedDevices;
 
     const toast = useToast();
-    // Use a ref so ws.onmessage always calls the latest toast.show without
-    // having to list `toast` as a useCallback dep (which would cause reconnects).
     const toastShowRef = useRef(toast.show);
     toastShowRef.current = toast.show;
 
@@ -80,66 +83,133 @@ export default function MainLayout() {
         return () => clearInterval(interval);
     }, []);
 
-    // ── Stats polling via RTCPeerConnection ────────────────────────────────
-    const startStatsPolling = useCallback((pc: RTCPeerConnection) => {
-        if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-        prevBytesRef.current = null;
-
-        statsIntervalRef.current = window.setInterval(async () => {
-            try {
-                const stats = await pc.getStats();
-                stats.forEach((report) => {
-                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                        const resolution = `${report.frameWidth || 0}x${report.frameHeight || 0}`;
-                        const fps = Math.round(report.framesPerSecond || 0);
-
-                        const nowBytes: number = report.bytesReceived ?? 0;
-                        const nowTs = Date.now();
-                        let bitrate = 0;
-                        if (prevBytesRef.current) {
-                            const deltaBits = (nowBytes - prevBytesRef.current.bytes) * 8;
-                            const deltaSec = (nowTs - prevBytesRef.current.ts) / 1000;
-                            if (deltaSec > 0) bitrate = Math.round(deltaBits / 1000 / deltaSec);
-                        }
-                        prevBytesRef.current = { bytes: nowBytes, ts: nowTs };
-
-                        setConnectionStats(prev => ({ ...prev, resolution, fps, bitrate }));
-                    }
-                    if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                        const rtt = report.currentRoundTripTime;
-                        if (rtt != null) {
-                            setConnectionStats(prev => ({
-                                ...prev,
-                                latency: Math.round(rtt * 1000),
-                            }));
-                        }
-                    }
-                });
-            } catch {}
-        }, 1000);
+    // ── Drain MSE queue ─────────────────────────────────────────────────────
+    const drainMSE = useCallback(() => {
+        const sb = sbRef.current;
+        if (!sb || sb.updating || pendingChunksRef.current.length === 0) return;
+        try {
+            sb.appendBuffer(pendingChunksRef.current.shift()!);
+        } catch (e: any) {
+            if (e?.name === 'QuotaExceededError') {
+                // Remove oldest ~10s of buffered data to make room
+                if (sb.buffered.length > 0) {
+                    try { sb.remove(sb.buffered.start(0), sb.buffered.start(0) + 10); } catch {}
+                }
+            } else {
+                pendingChunksRef.current = []; // clear on other errors
+            }
+        }
     }, []);
 
+    // ── Append a binary chunk to MSE ────────────────────────────────────────
+    const appendChunk = useCallback((buffer: ArrayBuffer) => {
+        chunkBytesRef.current += buffer.byteLength;
+        pendingChunksRef.current.push(buffer);
+
+        // Cap queue to ~30 chunks to prevent unbounded memory growth
+        while (pendingChunksRef.current.length > 30) pendingChunksRef.current.shift();
+
+        drainMSE();
+    }, [drainMSE]);
+
+    // ── Start MSE-based preview ─────────────────────────────────────────────
+    const initPreviewMSE = useCallback((mimeType: string) => {
+        // Clean up any existing MSE session
+        if (statsIntervalRef.current) {
+            clearInterval(statsIntervalRef.current);
+            statsIntervalRef.current = null;
+        }
+        sbRef.current = null;
+        pendingChunksRef.current = [];
+        chunkBytesRef.current = 0;
+
+        if (!('MediaSource' in window)) {
+            console.warn('[Preview] MediaSource not supported');
+            return;
+        }
+        if (!MediaSource.isTypeSupported(mimeType)) {
+            console.warn('[Preview] Unsupported MIME type:', mimeType);
+            // Try a fallback
+            const fallback = 'video/webm; codecs=vp8';
+            if (mimeType !== fallback && MediaSource.isTypeSupported(fallback)) {
+                initPreviewMSE(fallback);
+            }
+            return;
+        }
+
+        const ms = new MediaSource();
+        msRef.current = ms;
+        const url = URL.createObjectURL(ms);
+
+        ms.addEventListener('sourceopen', () => {
+            try {
+                const sb = ms.addSourceBuffer(mimeType);
+                sbRef.current = sb;
+                sb.addEventListener('updateend', drainMSE);
+                // Flush anything already queued
+                drainMSE();
+            } catch (e) {
+                console.error('[MSE] addSourceBuffer error:', e);
+            }
+        }, { once: true });
+
+        if (videoRef.current) {
+            videoRef.current.src = url;
+            videoRef.current.play().catch(() => {});
+        }
+
+        setConnectionStats(prev => ({ ...prev, status: 'live' }));
+
+        // Stats polling using video element metrics
+        let lastFrames = 0;
+        statsIntervalRef.current = window.setInterval(() => {
+            const v = videoRef.current;
+            if (!v) return;
+            const w = v.videoWidth;
+            const h = v.videoHeight;
+            const quality = (v as any).getVideoPlaybackQuality?.();
+            const totalFrames = quality?.totalVideoFrames ?? 0;
+            const fps = Math.max(0, totalFrames - lastFrames);
+            lastFrames = totalFrames;
+
+            const bytes = chunkBytesRef.current;
+            chunkBytesRef.current = 0;
+
+            setConnectionStats(prev => ({
+                ...prev,
+                ...(w && h ? { resolution: `${w}x${h}`, fps } : {}),
+                bitrate: Math.round(bytes * 8 / 1000),
+                latency: 0,
+            }));
+        }, 1000);
+    }, [drainMSE]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── Stop preview ────────────────────────────────────────────────────────
     const stopPreview = useCallback(() => {
         if (statsIntervalRef.current) {
             clearInterval(statsIntervalRef.current);
             statsIntervalRef.current = null;
         }
-        if (videoRef.current?.srcObject) {
-            const stream = videoRef.current.srcObject as MediaStream;
-            stream.getTracks().forEach(t => t.stop());
+        sbRef.current = null;
+        msRef.current = null;
+        pendingChunksRef.current = [];
+
+        if (videoRef.current) {
+            videoRef.current.src = '';
             videoRef.current.srcObject = null;
         }
-        if (previewPcRef.current) {
-            previewPcRef.current.close();
-            previewPcRef.current = null;
-        }
+
         setConnectionStats(prev => ({
             ...prev,
             status: connectedDevicesRef.current.length > 0 ? 'connected' : 'disconnected',
+            fps: 0,
+            bitrate: 0,
+            resolution: '-',
+            latency: 0,
         }));
-    }, []);
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // ── WebSocket + preview WebRTC ──────────────────────────────────────────
+    // ── WebSocket signaling ─────────────────────────────────────────────────
     const connectWebSocket = useCallback(() => {
         setConnectionStats(prev => ({ ...prev, status: 'connecting' }));
 
@@ -167,6 +237,13 @@ export default function MainLayout() {
         };
 
         ws.onmessage = async (event) => {
+            // ── Binary message = video preview chunk ──────────────────────
+            if (event.data instanceof Blob) {
+                const buffer = await event.data.arrayBuffer();
+                appendChunk(buffer);
+                return;
+            }
+
             let msg: any;
             try {
                 msg = JSON.parse(event.data as string);
@@ -179,7 +256,7 @@ export default function MainLayout() {
                 const id = (msg.deviceName || 'device') + (msg.platform || '');
                 setConnectedDevices(prev => {
                     if (prev.some(d => d.id === id)) return prev;
-                        toastShowRef.current(`${msg.deviceName || 'Phone'} connected`, 'success');
+                    toastShowRef.current(`${msg.deviceName || 'Phone'} connected`, 'success');
                     return [
                         ...prev,
                         {
@@ -210,104 +287,29 @@ export default function MainLayout() {
             } else if (msg.type === 'client-disconnect') {
                 setConnectedDevices(prev => prev.filter(d => d.id !== msg.clientId));
                 toastShowRef.current('Phone disconnected', 'info');
+                stopPreview();
 
-            // ── Preview offer from phone ──────────────────────────────────
-            } else if (msg.type === 'preview-offer') {
-                try {
-                    // Close any existing preview PC
-                    if (previewPcRef.current) {
-                        previewPcRef.current.close();
-                        previewPcRef.current = null;
-                    }
-                    if (statsIntervalRef.current) {
-                        clearInterval(statsIntervalRef.current);
-                        statsIntervalRef.current = null;
-                    }
+            // ── Preview stream starting ───────────────────────────────────
+            } else if (msg.type === 'preview-start') {
+                const mimeType: string = msg.mimeType || 'video/webm; codecs=vp8';
+                initPreviewMSE(mimeType);
 
-                    const pc = new RTCPeerConnection({
-                        iceServers: [
-                            { urls: 'stun:stun.l.google.com:19302' },
-                            { urls: 'stun:stun1.l.google.com:19302' },
-                        ],
-                    });
-                    previewPcRef.current = pc;
-
-                    pc.ontrack = (trackEvent) => {
-                        if (videoRef.current && trackEvent.streams[0]) {
-                            videoRef.current.srcObject = trackEvent.streams[0];
-                            videoRef.current.muted = true;
-                            setConnectionStats(prev => ({ ...prev, status: 'live' }));
-                            startStatsPolling(pc);
-                        }
-                    };
-
-                    pc.onicecandidate = (iceEvent) => {
-                        if (iceEvent.candidate) {
-                            ws.send(JSON.stringify({
-                                type: 'preview-ice-candidate',
-                                candidate: iceEvent.candidate.candidate,
-                                sdp_mid: iceEvent.candidate.sdpMid,
-                                sdp_m_line_index: iceEvent.candidate.sdpMLineIndex,
-                            }));
-                        }
-                    };
-
-                    pc.onconnectionstatechange = () => {
-                        if (
-                            pc.connectionState === 'disconnected' ||
-                            pc.connectionState === 'failed'
-                        ) {
-                            if (videoRef.current) videoRef.current.srcObject = null;
-                            setConnectionStats(prev => ({
-                                ...prev,
-                                status: prev.status === 'live' ? 'connected' : prev.status,
-                            }));
-                            if (statsIntervalRef.current) {
-                                clearInterval(statsIntervalRef.current);
-                                statsIntervalRef.current = null;
-                            }
-                        }
-                    };
-
-                    await pc.setRemoteDescription(
-                        new RTCSessionDescription({ type: 'offer', sdp: msg.sdp })
-                    );
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-
-                    ws.send(JSON.stringify({
-                        type: 'preview-answer',
-                        sdp: answer.sdp,
-                    }));
-                } catch (e) {
-                    console.error('[Preview] WebRTC error:', e);
-                }
-
-            // ── Preview ICE candidate from phone ──────────────────────────
-            } else if (msg.type === 'preview-ice-candidate') {
-                if (previewPcRef.current) {
-                    try {
-                        await previewPcRef.current.addIceCandidate(new RTCIceCandidate({
-                            candidate: msg.candidate,
-                            sdpMid: msg.sdp_mid,
-                            sdpMLineIndex: msg.sdp_m_line_index,
-                        }));
-                    } catch {}
-                }
+            // ── Preview stream stopping ───────────────────────────────────
+            } else if (msg.type === 'preview-stop') {
+                stopPreview();
             }
         };
-    }, [startStatsPolling]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [appendChunk, initPreviewMSE, stopPreview]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
         connectWebSocket();
         return () => {
             if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-            previewPcRef.current?.close();
             wsRef.current?.close();
         };
     }, [connectWebSocket]);
 
-    // ── Virtual camera toggle (separate from preview) ─────────────────────
+    // ── Virtual camera toggle ─────────────────────────────────────────────
     const toggleVirtualCam = async () => {
         try {
             if (virtualCamActive) {
@@ -321,7 +323,18 @@ export default function MainLayout() {
             }
         } catch (e) {
             console.error('[VCam] Toggle error:', e);
-            toast.show('Virtual Camera not available on this system', 'error');
+            const errStr = String(e);
+            let msg: string;
+            if (errStr.includes('22000') || errStr.includes('Windows 11') || errStr.includes('REGDB') || errStr.includes('80040154')) {
+                msg = 'Virtual Camera requires Windows 11 build 22000+';
+            } else if (errStr.includes('not supported') || errStr.includes('C00D36D5')) {
+                msg = 'Virtual Camera is not supported on this system';
+            } else if (errStr.includes('COM') || errStr.includes('registered')) {
+                msg = 'Virtual Camera needs COM server setup — see the docs';
+            } else {
+                msg = `Virtual Camera error — ${errStr.slice(0, 60)}`;
+            }
+            toast.show(msg, 'error');
         }
     };
 
@@ -337,7 +350,6 @@ export default function MainLayout() {
                     status={connectionStats.status}
                     stats={connectionStats}
                     mirror={mirrorVideo}
-                    startStatsPolling={startStatsPolling}
                 />
             </div>
             <ControlBar
